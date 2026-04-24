@@ -1,111 +1,86 @@
-# Appsmith UI + n8n API + ESP32-C3 YK04 RF
+# Remote Timer (Bun)
 
-UI - Remote-Timers.json (import to Appsmith)
+Remote timer system with:
 
-API - multi-timer.json (import to n8n)
+- Bun API (`api.ts`) for timer state + labels
+- Bun UI (`ui.ts`) that proxies API calls
+- ESP32-C3 firmware (`remote-timer.ino`) that sends timer events
 
-device/button - remote-timer.ino (upload via Arduino to ESP32-C3 board)
+## API Routes (port 3001)
 
-# ESP32-C3 Remote Timer (YK04 + Buzzer)
+- `POST /api/timer?id=<suffix>-<button>`
+- `DELETE /api/timer?id=<suffix>-<button>`
+- `GET /api/timers`
+- `DELETE /api/timers`
+- `GET /api/labels`
+- `POST /api/labels`
+- `DELETE /api/labels`
+- `GET /health`
 
-This project runs on an ESP32-C3 and uses a YK04 4-button RF receiver.
+## Local Run (Bun)
 
-- Short press on a button: `POST /api/timer?id=<deviceId>:<button>`
-- Long press on a button: `DELETE /api/timer?id=<deviceId>:<button>`
-- No request body is sent for either method.
+Requirements:
 
-`deviceId` is generated from the ESP32-C3 eFuse MAC (stable per device).
+- Bun installed
 
-## File
+Run API:
 
-- `remote-timer.ino`
+```bash
+bun run api.ts
+```
 
-## Hardware
+Run UI (new terminal):
 
-- ESP32-C3 board
-- YK04 receiver module (4 digital outputs)
-- Buzzer (active or passive)
+```bash
+bun run ui.ts
+```
 
-## Wiring
+Open:
 
-Update pins in `remote-timer.ino` for your board/wiring.
+- UI: `http://localhost:3000`
+- API health: `http://localhost:3001/health`
 
-Current defaults:
+## Docker / Portainer
 
-- YK04 buttons -> GPIO `2`, `3`, `4`, `5`
-- Buzzer -> GPIO `10`
+Use `compose.yml`:
+
+```bash
+docker compose up -d --build
+```
+
+Open:
+
+- UI: `http://<host-ip>:3000`
+- API: `http://<host-ip>:3001`
 
 Notes:
 
-- Code assumes YK04 output is **HIGH while pressed**.
-- If your receiver is inverted, change `digitalRead(...) == HIGH` accordingly.
+- API data persists in `./data/timer-data.json` via mounted volume.
+- `data/` is excluded from git and Docker build context.
 
-## Build / Flash
+## ESP32 Firmware
 
-1. Open `remote-timer.ino` in Arduino IDE (or PlatformIO).
-2. Install/select an ESP32 board package.
-3. Choose an ESP32-C3 board profile matching your hardware.
-4. Compile and upload.
-5. Open Serial Monitor at `115200` baud.
+File: `remote-timer.ino`
 
-## First-Time Setup (Wi-Fi + API)
+In config portal (`http://192.168.4.1`), set:
 
-On boot, device starts AP mode for config portal.
+- Wi-Fi SSID/password
+- API host (`host:port`), for example `192.168.1.42:3001`
+- Optional bearer token
 
-- AP SSID format: `RemoteTimer-XXXXXX`
-- Connect to that AP.
-- Open `http://192.168.4.1/`
-- Fill in:
-  - Wi-Fi SSID/password
-  - Timer API host (default host: `192.168.1.101:30109`, path auto-appended as `/api/timer`)
-  - Optional Bearer token
-- Save.
+Firmware constructs endpoint automatically as:
 
-Settings are stored in ESP32 NVS (`Preferences`) and persist across reboot.
+- `http://<api-host>/api/timer?id=<suffix>-<button>`
 
-## API Behavior
+Behavior:
 
-Given button `N` (1..4), device calls:
+- Short press: `POST`
+- Long press: `DELETE`
 
-- Short press: `POST <timerUrl>?id=<deviceId>:N`
-- Long press: `DELETE <timerUrl>?id=<deviceId>:N`
+## Repo Layout
 
-Example:
-
-- `POST http://192.168.1.101:30109/api/timer?id=ABCDEF123456:1`
-- `DELETE http://192.168.1.101:30109/api/timer?id=ABCDEF123456:1`
-
-If configured, header is included:
-
-- `Authorization: Bearer <token>`
-
-## Current Timing / UX
-
-- Debounce: `100 ms`
-- Long press threshold: `1200 ms`
-- Main loop delay: `50 ms`
-- Button press tone duration: `90 ms`
-- Per-button tones:
-  - Button 1: `523 Hz`
-  - Button 2: `659 Hz`
-  - Button 3: `784 Hz`
-  - Button 4: `988 Hz`
-
-## Tuning
-
-Edit constants near top of `remote-timer.ino`:
-
-- `BUTTON_PINS`
-- `BUZZER_PIN`
-- `DEBOUNCE_MS`
-- `LONG_PRESS_MS`
-- `TONE_MS`
-- `BUTTON_TONES`
-- `WIFI_CONNECT_TIMEOUT`, `WIFI_RETRY_INTERVAL`
-
-## Troubleshooting
-
-- If API calls fail, check Serial Monitor for HTTP status and error text.
-- If no press detected, verify YK04 output voltage/polarity and shared ground.
-- If buzzer is silent, verify buzzer type and pin; adjust `BUZZER_PIN`.
-- If Wi-Fi does not connect, re-open portal AP and update credentials.
+- `api.ts` - Bun API server
+- `ui.ts` - Bun UI + proxy server
+- `remote-timer.ino` - ESP32 firmware
+- `compose.yml` - Docker Compose deployment
+- `Dockerfile` - Bun runtime image
