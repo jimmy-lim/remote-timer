@@ -3,17 +3,26 @@
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+
+#define LED_PIN 8
+unsigned long lastLedToggle = 0;
+bool ledState = false;
 
 // Buzzer output pin (adjust for your ESP32-C3 wiring).
 constexpr uint8_t BUZZER_PIN = 10;
-constexpr uint8_t BUZZER_CHANNEL = 0;
-constexpr uint16_t BUTTON_TONES[4] = {523, 659, 784, 988}; // C5, E5, G5, B5
+constexpr uint16_t SHORT_PRESS_TONES[4] = {523, 659, 784, 988}; // C5, E5, G5, B5
+constexpr uint16_t LONG_PRESS_TONES[4] = {392, 494, 587, 698};  // G4, B4, D5, F5
 constexpr unsigned long TONE_MS = 90;
+constexpr unsigned long TONE_GAP_MS = 70;
 
 // YK04 receiver outputs (adjust pins to match your board wiring).
-constexpr uint8_t BUTTON_PINS[4] = {2, 3, 4, 5};
+constexpr uint8_t BUTTON_PINS[4] = {0, 1, 3, 4};
 constexpr unsigned long DEBOUNCE_MS = 100;
-constexpr unsigned long LONG_PRESS_MS = 1200;
+constexpr unsigned long LONG_PRESS_MS = 2000;
 
 // Wi-Fi and config portal.
 constexpr unsigned long WIFI_CONNECT_TIMEOUT = 15000UL;
@@ -39,12 +48,29 @@ struct ButtonState {
   unsigned long pressedAt = 0;
 };
 
+struct TimerAction {
+  uint8_t buttonIndex = 0;
+  bool isDelete = false;
+};
+
+struct TonePattern {
+  uint16_t frequency = 0;
+  uint8_t beepsRemaining = 0;
+  unsigned long toneMs = 0;
+  unsigned long gapMs = 0;
+};
+
 Preferences prefs;
 DeviceConfig cfg;
 WebServer configServer(80);
 ButtonState buttons[4];
+QueueHandle_t actionQueue = nullptr;
+QueueHandle_t toneQueue = nullptr;
+SemaphoreHandle_t statusMutex = nullptr;
 
 unsigned long lastReconnectAttempt = 0;
+bool wifiConnectInProgress = false;
+unsigned long wifiConnectStartedAt = 0;
 
 String statusLine = "Booting";
 unsigned long statusUpdatedAt = 0;
@@ -52,10 +78,33 @@ unsigned long statusUpdatedAt = 0;
 String apSsid;
 String deviceId;
 
+String suffix;
+bool toneOutputActive = false;
+bool tonePatternActive = false;
+TonePattern currentTonePattern;
+unsigned long toneStageEndsAt = 0;
+
 static void setStatus(const String& s) {
+  if (statusMutex != nullptr) {
+    xSemaphoreTake(statusMutex, portMAX_DELAY);
+  }
   statusLine = s;
   statusUpdatedAt = millis();
+  if (statusMutex != nullptr) {
+    xSemaphoreGive(statusMutex);
+  }
   Serial.println(s);
+}
+
+static String getStatusLine() {
+  if (statusMutex != nullptr) {
+    xSemaphoreTake(statusMutex, portMAX_DELAY);
+  }
+  String current = statusLine;
+  if (statusMutex != nullptr) {
+    xSemaphoreGive(statusMutex);
+  }
+  return current;
 }
 
 static String appendIdQuery(const String& baseUrl, const String& idValue) {
@@ -93,27 +142,38 @@ void saveConfig() {
   prefs.end();
 }
 
-bool connectWiFi() {
+void beginWiFiConnect() {
   if (!cfg.ssid[0]) {
     setStatus("No WiFi SSID configured");
-    return false;
+    wifiConnectInProgress = false;
+    return;
   }
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.begin(cfg.ssid, cfg.password);
+  wifiConnectInProgress = true;
+  wifiConnectStartedAt = millis();
+  lastReconnectAttempt = wifiConnectStartedAt;
+  setStatus("Connecting WiFi...");
+}
 
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT) {
-    delay(200);
+void updateWiFiConnection(unsigned long now) {
+  if (!wifiConnectInProgress) {
+    return;
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
+  wl_status_t status = WiFi.status();
+  if (status == WL_CONNECTED) {
+    wifiConnectInProgress = false;
     setStatus("WiFi connected: " + WiFi.localIP().toString());
-    return true;
+    return;
   }
 
-  setStatus("WiFi connect failed");
-  return false;
+  if (now - wifiConnectStartedAt >= WIFI_CONNECT_TIMEOUT) {
+    wifiConnectInProgress = false;
+    WiFi.disconnect();
+    setStatus("WiFi connect failed");
+  }
 }
 
 String portalPage() {
@@ -136,7 +196,7 @@ String portalPage() {
   }
 
   html += "<p><b>Status:</b> ";
-  html += statusLine;
+  html += getStatusLine();
   html += "</p>";
 
   html += "<form method='POST' action='/save'>";
@@ -179,18 +239,14 @@ void handleSave() {
   }
 
   saveConfig();
-  bool ok = connectWiFi();
+  beginWiFiConnect();
 
-  String body = "<h2>Saved</h2><p>WiFi reconnect: ";
-  body += ok ? "OK" : "Failed";
-  body += "</p><a href='/'>Back</a>";
+  String body = "<h2>Saved</h2><p>WiFi reconnect started. Check status on the main page.</p><a href='/'>Back</a>";
   configServer.send(200, "text/html", body);
 }
 
 void startPortal() {
-  uint64_t mac = ESP.getEfuseMac();
-  char suffix[7];
-  snprintf(suffix, sizeof(suffix), "%06llX", mac & 0xFFFFFFULL);
+  
   apSsid = String("RemoteTimer-") + suffix;
 
   WiFi.mode(WIFI_AP_STA);
@@ -204,20 +260,20 @@ void startPortal() {
   setStatus("Config AP: " + apSsid);
 }
 
-bool postTimerAction(uint8_t buttonIndex, const char* action) {
+bool performTimerAction(uint8_t buttonIndex, const char* action) {
   if (WiFi.status() != WL_CONNECTED) {
     setStatus("API skipped: no WiFi");
     return false;
   }
 
-  String idValue = deviceId + ":" + String(buttonIndex + 1);
+  String idValue = suffix + "-" + String(buttonIndex + 1);
   String url = appendIdQuery(String(cfg.webhookUrl), idValue);
   HTTPClient http;
   WiFiClient client;
   http.begin(client, url);
-  if (cfg.bearerToken[0]) {
-    http.addHeader("Authorization", String("Bearer ") + cfg.bearerToken);
-  }
+//  if (cfg.bearerToken[0]) {
+//    http.addHeader("Authorization", String("Bearer ") + cfg.bearerToken);
+//  }
 
   int code = 0;
   if (strcmp(action, "delete") == 0) {
@@ -237,20 +293,107 @@ bool postTimerAction(uint8_t buttonIndex, const char* action) {
   return false;
 }
 
-void playButtonTone(uint8_t buttonIndex) {
-  if (buttonIndex >= 4) {
+bool enqueueTimerAction(uint8_t buttonIndex, bool isDelete) {
+  if (actionQueue == nullptr) {
+    setStatus("API queue unavailable");
+    return false;
+  }
+
+  TimerAction action;
+  action.buttonIndex = buttonIndex;
+  action.isDelete = isDelete;
+
+  BaseType_t queued = xQueueSend(actionQueue, &action, 0);
+  if (queued != pdTRUE) {
+    setStatus("API queue full");
+    return false;
+  }
+
+  setStatus(String(isDelete ? "delete" : "set") + " btn " + String(buttonIndex + 1) + " queued");
+  return true;
+}
+
+bool enqueueTonePattern(uint8_t buttonIndex, bool isLongPress, uint8_t beepCount) {
+  if (buttonIndex >= 4 || toneQueue == nullptr) {
+    return false;
+  }
+
+  TonePattern pattern;
+  pattern.frequency = isLongPress ? LONG_PRESS_TONES[buttonIndex] : SHORT_PRESS_TONES[buttonIndex];
+  pattern.beepsRemaining = beepCount;
+  pattern.toneMs = TONE_MS;
+  pattern.gapMs = TONE_GAP_MS;
+
+  return xQueueSend(toneQueue, &pattern, 0) == pdTRUE;
+}
+
+void timerActionTask(void* parameter) {
+  TimerAction action;
+
+  for (;;) {
+    if (xQueueReceive(actionQueue, &action, portMAX_DELAY) == pdTRUE) {
+      if (performTimerAction(action.buttonIndex, action.isDelete ? "delete" : "set")) {
+        enqueueTonePattern(action.buttonIndex, action.isDelete, 2);
+      }
+    }
+  }
+}
+
+void startTonePattern(const TonePattern& pattern, unsigned long now) {
+  if (pattern.frequency == 0 || pattern.beepsRemaining == 0) {
     return;
   }
-  ledcWriteTone(BUZZER_CHANNEL, BUTTON_TONES[buttonIndex]);
-  delay(TONE_MS);
-  ledcWriteTone(BUZZER_CHANNEL, 0);
+
+  currentTonePattern = pattern;
+  tonePatternActive = true;
+  toneOutputActive = true;
+  ledcWriteTone(BUZZER_PIN, currentTonePattern.frequency);
+  toneStageEndsAt = now + currentTonePattern.toneMs;
+}
+
+void updateTone(unsigned long now) {
+  if (!tonePatternActive && toneQueue != nullptr) {
+    TonePattern nextPattern;
+    if (xQueueReceive(toneQueue, &nextPattern, 0) == pdTRUE) {
+      startTonePattern(nextPattern, now);
+    }
+  }
+
+  if (!tonePatternActive || (long)(now - toneStageEndsAt) < 0) {
+    return;
+  }
+
+  if (toneOutputActive) {
+    ledcWriteTone(BUZZER_PIN, 0);
+    toneOutputActive = false;
+    currentTonePattern.beepsRemaining--;
+
+    if (currentTonePattern.beepsRemaining == 0) {
+      tonePatternActive = false;
+    } else {
+      toneStageEndsAt = now + currentTonePattern.gapMs;
+    }
+    return;
+  }
+
+  toneOutputActive = true;
+  ledcWriteTone(BUZZER_PIN, currentTonePattern.frequency);
+  toneStageEndsAt = now + currentTonePattern.toneMs;
 }
 
 void handleButtonAction(uint8_t i, bool isLongPress) {
   if (isLongPress) {
-    postTimerAction(i, "delete");
+    Serial.print("Button ");
+    Serial.print(i);
+    Serial.println(" - Action: LONG PRESS (Delete)");
+    enqueueTonePattern(i, true, 1);
+    enqueueTimerAction(i, true);
   } else {
-    postTimerAction(i, "restart");
+    Serial.print("Button Index: ");
+    Serial.print(i);
+    Serial.println(" - Action: SHORT PRESS (Set)");
+    enqueueTonePattern(i, false, 1);
+    enqueueTimerAction(i, false);
   }
 }
 
@@ -278,7 +421,6 @@ void updateButtons() {
       if (b.stablePressed) {
         b.pressedAt = now;
         b.longTriggered = false;
-        playButtonTone(i);
       } else {
         if (!b.longTriggered) {
           handleButtonAction(i, false);
@@ -294,37 +436,65 @@ void updateButtons() {
 }
 
 void setup() {
-  Serial.begin(115200);
-  delay(100);
-  Serial.println("=== ESP32-C3 Remote Timer Boot ===");
-  char deviceBuf[13];
-  snprintf(deviceBuf, sizeof(deviceBuf), "%012llX", ESP.getEfuseMac() & 0xFFFFFFFFFFFFULL);
-  deviceId = String(deviceBuf);
-  ledcSetup(BUZZER_CHANNEL, 2000, 8);
-  ledcAttachPin(BUZZER_PIN, BUZZER_CHANNEL);
-  ledcWriteTone(BUZZER_CHANNEL, 0);
 
+  pinMode(LED_PIN, OUTPUT);
+  
+  Serial.begin(115200);
+  Serial.println("=== ESP32-C3 Remote Timer Boot ===");
+  statusMutex = xSemaphoreCreateMutex();
+  actionQueue = xQueueCreate(8, sizeof(TimerAction));
+  toneQueue = xQueueCreate(16, sizeof(TonePattern));
+  uint64_t mac = ESP.getEfuseMac();
+  char suffixBuf[7];
+  snprintf(suffixBuf, sizeof(suffixBuf), "%06llX", mac & 0xFFFFFFULL);
+  suffix = String(suffixBuf);
+  char deviceBuf[13];
+  snprintf(deviceBuf, sizeof(deviceBuf), "%012llX", mac & 0xFFFFFFFFFFFFULL);
+  deviceId = String(deviceBuf);
+
+  ledcAttach(BUZZER_PIN, 2000, 8);
+  ledcWriteTone(BUZZER_PIN, 0);
+ 
   for (uint8_t i = 0; i < 4; i++) {
     pinMode(BUTTON_PINS[i], INPUT);
   }
 
   loadConfig();
   startPortal();
+  if (actionQueue != nullptr) {
+    xTaskCreate(
+      timerActionTask,
+      "timer-action",
+      8192,
+      nullptr,
+      1,
+      nullptr
+    );
+  } else {
+    setStatus("API queue init failed");
+  }
 
-  connectWiFi();
+  beginWiFiConnect();
 }
 
 void loop() {
+  unsigned long now = millis();
+
   configServer.handleClient();
   updateButtons();
+  updateTone(now);
+  updateWiFiConnection(now);
 
-  if (WiFi.status() != WL_CONNECTED) {
-    unsigned long now = millis();
+  if (WiFi.status() != WL_CONNECTED && !wifiConnectInProgress) {
     if (now - lastReconnectAttempt >= WIFI_RETRY_INTERVAL) {
-      lastReconnectAttempt = now;
-      connectWiFi();
+      beginWiFiConnect();
     }
   }
 
-  delay(50);
+  // LED Toggle Logic (e.g., every 1000ms)
+  if (now - lastLedToggle >= 1000) {
+    lastLedToggle = now;
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState);
+  }  
 }

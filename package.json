@@ -1,0 +1,11 @@
+{
+  "name": "remote-timer-frontend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run ui.ts",
+    "start": "bun run ui.ts",
+    "dev:ui": "bun run ui.ts",
+    "dev:api": "bun run api.ts"
+  }
+}
