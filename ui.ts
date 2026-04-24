@@ -1,7 +1,7 @@
 const PORT = Number(process.env.PORT || 3000);
 const API_BASE_URL = process.env.API_BASE_URL || "http://127.0.0.1:3001";
 const TIMERS_URL =
-  process.env.TIMERS_URL || `${API_BASE_URL.replace(/\/$/, "")}/webhook/timers`;
+  process.env.TIMERS_URL || `${API_BASE_URL.replace(/\/$/, "")}/api/timers`;
 const TIMER_URL =
   process.env.TIMER_URL ||
   (TIMERS_URL.endsWith("/timers")

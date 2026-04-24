@@ -14,15 +14,16 @@ bool ledState = false;
 
 // Buzzer output pin (adjust for your ESP32-C3 wiring).
 constexpr uint8_t BUZZER_PIN = 10;
-constexpr uint16_t SHORT_PRESS_TONES[4] = {523, 659, 784, 988}; // C5, E5, G5, B5
-constexpr uint16_t LONG_PRESS_TONES[4] = {392, 494, 587, 698};  // G4, B4, D5, F5
+constexpr uint16_t SHORT_PRESS_TONES[4] = {392, 494, 587, 698}; // G4, B4, D5, F5
+constexpr uint16_t LONG_PRESS_TONES[4] = {523, 659, 784, 988};  // C5, E5, G5, B5
 constexpr unsigned long TONE_MS = 90;
 constexpr unsigned long TONE_GAP_MS = 70;
 
 // YK04 receiver outputs (adjust pins to match your board wiring).
 constexpr uint8_t BUTTON_PINS[4] = {0, 1, 3, 4};
+constexpr uint8_t BUTTON_COUNT = sizeof(BUTTON_PINS) / sizeof(BUTTON_PINS[0]);
 constexpr unsigned long DEBOUNCE_MS = 100;
-constexpr unsigned long LONG_PRESS_MS = 2000;
+constexpr unsigned long LONG_PRESS_MS = 3000;
 
 // Wi-Fi and config portal.
 constexpr unsigned long WIFI_CONNECT_TIMEOUT = 15000UL;
@@ -30,13 +31,17 @@ constexpr unsigned long WIFI_RETRY_INTERVAL = 20000UL;
 
 constexpr size_t SSID_MAX_LEN = 32;
 constexpr size_t PASS_MAX_LEN = 64;
-constexpr size_t URL_MAX_LEN = 128;
+constexpr size_t HOST_MAX_LEN = 128;
 constexpr size_t TOKEN_MAX_LEN = 128;
+constexpr uint8_t ACTION_QUEUE_LEN = 8;
+constexpr uint8_t TONE_QUEUE_LEN = 16;
+constexpr unsigned long LED_TOGGLE_MS = 1000UL;
+constexpr unsigned long LOOP_DELAY_MS = 1UL;
 
 struct DeviceConfig {
   char ssid[SSID_MAX_LEN + 1] = {};
   char password[PASS_MAX_LEN + 1] = {};
-  char webhookUrl[URL_MAX_LEN + 1] = "http://192.168.1.101:30109/webhook/timer";
+  char apiHost[HOST_MAX_LEN + 1] = "192.168.1.101:30109";
   char bearerToken[TOKEN_MAX_LEN + 1] = {};
 };
 
@@ -63,7 +68,7 @@ struct TonePattern {
 Preferences prefs;
 DeviceConfig cfg;
 WebServer configServer(80);
-ButtonState buttons[4];
+ButtonState buttons[BUTTON_COUNT];
 QueueHandle_t actionQueue = nullptr;
 QueueHandle_t toneQueue = nullptr;
 SemaphoreHandle_t statusMutex = nullptr;
@@ -77,6 +82,7 @@ unsigned long statusUpdatedAt = 0;
 
 String apSsid;
 String deviceId;
+String webhookBase;
 
 String suffix;
 bool toneOutputActive = false;
@@ -117,27 +123,124 @@ static String appendIdQuery(const String& baseUrl, const String& idValue) {
   return url;
 }
 
+static String htmlEscape(const String& value) {
+  String escaped;
+  escaped.reserve(value.length() + 16);
+  for (size_t i = 0; i < value.length(); ++i) {
+    char c = value.charAt(i);
+    switch (c) {
+      case '&':
+        escaped += "&amp;";
+        break;
+      case '<':
+        escaped += "&lt;";
+        break;
+      case '>':
+        escaped += "&gt;";
+        break;
+      case '"':
+        escaped += "&quot;";
+        break;
+      case '\'':
+        escaped += "&#39;";
+        break;
+      default:
+        escaped += c;
+        break;
+    }
+  }
+  return escaped;
+}
+
+static String hostFromWebhookUrl(const String& webhookUrl) {
+  String url = webhookUrl;
+  url.trim();
+  int start = 0;
+  if (url.startsWith("http://")) {
+    start = 7;
+  } else if (url.startsWith("https://")) {
+    start = 8;
+  }
+
+  int slash = url.indexOf('/', start);
+  if (slash < 0) {
+    slash = url.length();
+  }
+  return url.substring(start, slash);
+}
+
+static String webhookUrlFromHost(const String& apiHost) {
+  String host = apiHost;
+  host.trim();
+  if (host.startsWith("https://")) {
+    host.remove(0, 8);
+  } else if (host.startsWith("http://")) {
+    host.remove(0, 7);
+  }
+  if (!host.length()) {
+    return "";
+  }
+  if (host.startsWith("/")) {
+    return "";
+  }
+  int slash = host.indexOf('/');
+  if (slash >= 0) {
+    host = host.substring(0, slash);
+  }
+  if (!host.length()) {
+    return "";
+  }
+  if (host.indexOf(' ') >= 0) {
+    return "";
+  }
+  while (host.endsWith("/")) {
+    host.remove(host.length() - 1);
+  }
+  if (!host.length()) {
+    return "";
+  }
+
+  if (!host.startsWith("http://")) {
+    host = "http://" + host;
+  }
+  return host + "/api/timer";
+}
+
+static void refreshWebhookBase() {
+  webhookBase = webhookUrlFromHost(String(cfg.apiHost));
+}
+
 void loadConfig() {
   prefs.begin("remote-timer", true);
 
   String ssid = prefs.getString("ssid", "");
   String pass = prefs.getString("pass", "");
-  String webhook = prefs.getString("api_url", cfg.webhookUrl);
+  String host = prefs.getString("api_host", "");
+  String legacyWebhook = prefs.getString("api_url", "");
   String token = prefs.getString("api_token", "");
 
   prefs.end();
 
+  if (!host.length() && legacyWebhook.length()) {
+    host = hostFromWebhookUrl(legacyWebhook);
+  }
+  if (!host.length()) {
+    host = cfg.apiHost;
+  }
+
   ssid.toCharArray(cfg.ssid, sizeof(cfg.ssid));
   pass.toCharArray(cfg.password, sizeof(cfg.password));
-  webhook.toCharArray(cfg.webhookUrl, sizeof(cfg.webhookUrl));
+  host.toCharArray(cfg.apiHost, sizeof(cfg.apiHost));
   token.toCharArray(cfg.bearerToken, sizeof(cfg.bearerToken));
+  refreshWebhookBase();
 }
 
 void saveConfig() {
   prefs.begin("remote-timer", false);
   prefs.putString("ssid", cfg.ssid);
   prefs.putString("pass", cfg.password);
-  prefs.putString("api_url", cfg.webhookUrl);
+  prefs.putString("api_host", cfg.apiHost);
+  prefs.putString("api_url", webhookBase);
   prefs.putString("api_token", cfg.bearerToken);
   prefs.end();
 }
@@ -179,6 +282,13 @@ void updateWiFiConnection(unsigned long now) {
 String portalPage() {
   String html;
   html.reserve(2600);
+  String escapedStatus = htmlEscape(getStatusLine());
+  String escapedSsid = htmlEscape(String(cfg.ssid));
+  String escapedPassword = htmlEscape(String(cfg.password));
+  String escapedApiHost = htmlEscape(String(cfg.apiHost));
+  String escapedBearerToken = htmlEscape(String(cfg.bearerToken));
+  String escapedWebhookBase = htmlEscape(webhookBase);
+
   html += "<!doctype html><html><head><meta charset='utf-8'><title>Remote Timer Config</title>";
   html += "<style>body{font-family:sans-serif;max-width:760px;margin:1.5rem auto;padding:0 1rem;}";
   html += "label{display:block;margin-top:.8rem;font-weight:600}input{width:100%;padding:.5rem;}";
@@ -196,19 +306,19 @@ String portalPage() {
   }
 
   html += "<p><b>Status:</b> ";
-  html += getStatusLine();
+  html += escapedStatus;
   html += "</p>";
 
   html += "<form method='POST' action='/save'>";
   html += "<h2>WiFi</h2>";
-  html += "<label>SSID</label><input name='ssid' maxlength='32' value='" + String(cfg.ssid) + "'>";
-  html += "<label>Password</label><input type='password' name='password' maxlength='64' value='" + String(cfg.password) + "'>";
+  html += "<label>SSID</label><input name='ssid' maxlength='32' value='" + escapedSsid + "'>";
+  html += "<label>Password</label><input type='password' name='password' maxlength='64' value='" + escapedPassword + "'>";
 
   html += "<h2>API</h2>";
-  html += "<label>Timer Webhook URL</label><input name='api_url' maxlength='128' value='" + String(cfg.webhookUrl) + "'>";
-  html += "<label>Bearer Token (optional)</label><input type='password' name='api_token' maxlength='128' value='" + String(cfg.bearerToken) + "'>";
-  html += "<small>Short press: POST .../webhook/timer?id=device:button</small><br>";
-  html += "<small>Long press: DELETE .../webhook/timer?id=device:button</small><br>";
+  html += "<label>API Host (host:port)</label><input name='api_host' maxlength='128' value='" + escapedApiHost + "'>";
+  html += "<label>Bearer Token (optional)</label><input type='password' name='api_token' maxlength='128' value='" + escapedBearerToken + "'>";
+  html += "<small>Short press: POST " + escapedWebhookBase + "?id=suffix-button (e.g. " + suffix + "-1)</small><br>";
+  html += "<small>Long press: DELETE " + escapedWebhookBase + "?id=suffix-button (e.g. " + suffix + "-1)</small><br>";
   html += "<small>This device ID: ";
   html += deviceId;
   html += "</small><br>";
@@ -230,10 +340,11 @@ void copyFormField(const String& value, char* target, size_t maxSize) {
 void handleSave() {
   copyFormField(configServer.arg("ssid"), cfg.ssid, sizeof(cfg.ssid));
   copyFormField(configServer.arg("password"), cfg.password, sizeof(cfg.password));
-  copyFormField(configServer.arg("api_url"), cfg.webhookUrl, sizeof(cfg.webhookUrl));
+  copyFormField(configServer.arg("api_host"), cfg.apiHost, sizeof(cfg.apiHost));
   copyFormField(configServer.arg("api_token"), cfg.bearerToken, sizeof(cfg.bearerToken));
 
-  if (!cfg.webhookUrl[0]) {
+  refreshWebhookBase();
+  if (!cfg.apiHost[0] || !webhookBase.length()) {
     configServer.send(400, "text/html", "<h2>Invalid API config</h2><a href='/'>Back</a>");
     return;
   }
@@ -267,13 +378,17 @@ bool performTimerAction(uint8_t buttonIndex, const char* action) {
   }
 
   String idValue = suffix + "-" + String(buttonIndex + 1);
-  String url = appendIdQuery(String(cfg.webhookUrl), idValue);
+  if (!webhookBase.length()) {
+    setStatus("API skipped: invalid host");
+    return false;
+  }
+  String url = appendIdQuery(webhookBase, idValue);
   HTTPClient http;
   WiFiClient client;
   http.begin(client, url);
-//  if (cfg.bearerToken[0]) {
-//    http.addHeader("Authorization", String("Bearer ") + cfg.bearerToken);
-//  }
+  if (cfg.bearerToken[0]) {
+    http.addHeader("Authorization", String("Bearer ") + cfg.bearerToken);
+  }
 
   int code = 0;
   if (strcmp(action, "delete") == 0) {
@@ -281,14 +396,15 @@ bool performTimerAction(uint8_t buttonIndex, const char* action) {
   } else {
     code = http.sendRequest("POST");
   }
-  String resp = code > 0 ? http.getString() : http.errorToString(code);
-  http.end();
 
   if (code >= 200 && code < 300) {
+    http.end();
     setStatus(String(action) + " btn " + String(buttonIndex + 1) + " OK (" + String(code) + ")");
     return true;
   }
 
+  String resp = code > 0 ? http.getString() : http.errorToString(code);
+  http.end();
   setStatus(String(action) + " btn " + String(buttonIndex + 1) + " fail (" + String(code) + ") " + resp);
   return false;
 }
@@ -314,7 +430,7 @@ bool enqueueTimerAction(uint8_t buttonIndex, bool isDelete) {
 }
 
 bool enqueueTonePattern(uint8_t buttonIndex, bool isLongPress, uint8_t beepCount) {
-  if (buttonIndex >= 4 || toneQueue == nullptr) {
+  if (buttonIndex >= BUTTON_COUNT || toneQueue == nullptr) {
     return false;
   }
 
@@ -400,7 +516,7 @@ void handleButtonAction(uint8_t i, bool isLongPress) {
 void updateButtons() {
   unsigned long now = millis();
 
-  for (uint8_t i = 0; i < 4; i++) {
+  for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
     ButtonState& b = buttons[i];
 
     // Assumes YK04 receiver output is active HIGH while button held.
@@ -436,14 +552,13 @@ void updateButtons() {
 }
 
 void setup() {
-
   pinMode(LED_PIN, OUTPUT);
-  
+
   Serial.begin(115200);
   Serial.println("=== ESP32-C3 Remote Timer Boot ===");
   statusMutex = xSemaphoreCreateMutex();
-  actionQueue = xQueueCreate(8, sizeof(TimerAction));
-  toneQueue = xQueueCreate(16, sizeof(TonePattern));
+  actionQueue = xQueueCreate(ACTION_QUEUE_LEN, sizeof(TimerAction));
+  toneQueue = xQueueCreate(TONE_QUEUE_LEN, sizeof(TonePattern));
   uint64_t mac = ESP.getEfuseMac();
   char suffixBuf[7];
   snprintf(suffixBuf, sizeof(suffixBuf), "%06llX", mac & 0xFFFFFFULL);
@@ -454,8 +569,8 @@ void setup() {
 
   ledcAttach(BUZZER_PIN, 2000, 8);
   ledcWriteTone(BUZZER_PIN, 0);
- 
-  for (uint8_t i = 0; i < 4; i++) {
+
+  for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
     pinMode(BUTTON_PINS[i], INPUT);
   }
 
@@ -491,10 +606,11 @@ void loop() {
     }
   }
 
-  // LED Toggle Logic (e.g., every 1000ms)
-  if (now - lastLedToggle >= 1000) {
+  if (now - lastLedToggle >= LED_TOGGLE_MS) {
     lastLedToggle = now;
     ledState = !ledState;
     digitalWrite(LED_PIN, ledState);
-  }  
+  }
+
+  delay(LOOP_DELAY_MS);
 }

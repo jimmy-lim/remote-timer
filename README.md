@@ -1,4 +1,4 @@
-# Appsmith UI + n8n API/webhook + ESP32-C3 YK04 RF
+# Appsmith UI + n8n API + ESP32-C3 YK04 RF
 
 UI - Remote-Timers.json (import to Appsmith)
 
@@ -10,8 +10,8 @@ device/button - remote-timer.ino (upload via Arduino to ESP32-C3 board)
 
 This project runs on an ESP32-C3 and uses a YK04 4-button RF receiver.
 
-- Short press on a button: `POST /webhook/timer?id=<deviceId>:<button>`
-- Long press on a button: `DELETE /webhook/timer?id=<deviceId>:<button>`
+- Short press on a button: `POST /api/timer?id=<deviceId>:<button>`
+- Long press on a button: `DELETE /api/timer?id=<deviceId>:<button>`
 - No request body is sent for either method.
 
 `deviceId` is generated from the ESP32-C3 eFuse MAC (stable per device).
@@ -57,7 +57,7 @@ On boot, device starts AP mode for config portal.
 - Open `http://192.168.4.1/`
 - Fill in:
   - Wi-Fi SSID/password
-  - Timer Webhook URL (default: `http://192.168.1.101:30109/webhook/timer`)
+  - Timer API host (default host: `192.168.1.101:30109`, path auto-appended as `/api/timer`)
   - Optional Bearer token
 - Save.
 
@@ -67,13 +67,13 @@ Settings are stored in ESP32 NVS (`Preferences`) and persist across reboot.
 
 Given button `N` (1..4), device calls:
 
-- Short press: `POST <webhookUrl>?id=<deviceId>:N`
-- Long press: `DELETE <webhookUrl>?id=<deviceId>:N`
+- Short press: `POST <timerUrl>?id=<deviceId>:N`
+- Long press: `DELETE <timerUrl>?id=<deviceId>:N`
 
 Example:
 
-- `POST http://192.168.1.101:30109/webhook/timer?id=ABCDEF123456:1`
-- `DELETE http://192.168.1.101:30109/webhook/timer?id=ABCDEF123456:1`
+- `POST http://192.168.1.101:30109/api/timer?id=ABCDEF123456:1`
+- `DELETE http://192.168.1.101:30109/api/timer?id=ABCDEF123456:1`
 
 If configured, header is included:
 

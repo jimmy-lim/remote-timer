@@ -123,7 +123,7 @@ Bun.serve({
   async fetch(request) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/webhook/timer" && request.method === "POST") {
+    if (url.pathname === "/api/timer" && request.method === "POST") {
       const timerId = url.searchParams.get("id");
       if (!timerId) {
         return jsonResponse({ error: "Missing id query parameter" }, { status: 400 });
@@ -136,7 +136,7 @@ Bun.serve({
       return new Response(null, { status: 204 });
     }
 
-    if (url.pathname === "/webhook/timer" && request.method === "DELETE") {
+    if (url.pathname === "/api/timer" && request.method === "DELETE") {
       const timerId = url.searchParams.get("id");
       if (!timerId) {
         return jsonResponse({ error: "Missing id query parameter" }, { status: 400 });
@@ -149,12 +149,12 @@ Bun.serve({
       return new Response(null, { status: 204 });
     }
 
-    if (url.pathname === "/webhook/timers" && request.method === "GET") {
+    if (url.pathname === "/api/timers" && request.method === "GET") {
       const store = await readStore();
       return jsonResponse(timerEntries(store.timers));
     }
 
-    if (url.pathname === "/webhook/timers" && request.method === "DELETE") {
+    if (url.pathname === "/api/timers" && request.method === "DELETE") {
       const store = await readStore();
       store.timers = {};
       await writeStore(store);
