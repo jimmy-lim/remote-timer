@@ -744,7 +744,7 @@ const html = `<!doctype html>
 
       deleteAllButton.addEventListener("click", async () => {
         const confirmed = window.confirm(
-          "Delete all timers?\n\nThis will also delete all enriched data (label, notes, alert settings, muted, order) for every timer."
+          "Delete all timers?\\n\\nThis will also delete all enriched data (label, notes, alert settings, muted, order) for every timer."
         );
         if (!confirmed) return;
 
