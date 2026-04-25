@@ -108,18 +108,24 @@ bool timerActiveByButton[BUTTON_COUNT] = {false, false, false, false};
 uint64_t timerElapsedBaseMsByButton[BUTTON_COUNT] = {0, 0, 0, 0};
 unsigned long timerElapsedBaseAtMsByButton[BUTTON_COUNT] = {0, 0, 0, 0};
 uint64_t timerEpochMsByButton[BUTTON_COUNT] = {0, 0, 0, 0};
+uint32_t actionToneEnqueueCountByButton[BUTTON_COUNT] = {0, 0, 0, 0};
+uint32_t alertToneEnqueueCountByButton[BUTTON_COUNT] = {0, 0, 0, 0};
 bool deviceStateLoaded = false;
 uint8_t loadedTimerTonePendingMask = 0;
 bool loadedTimerToneStarted = false;
 unsigned long loadedTimerToneNextAt = 0;
+bool loadedTimerTonesPlayedThisBoot = false;
 bool rebootRequested = false;
 unsigned long rebootAt = 0;
+bool wifiReconnectRequested = false;
+unsigned long wifiReconnectAt = 0;
 
 static unsigned long effectiveElapsedMs(uint8_t idx, unsigned long now) {
   if (idx >= BUTTON_COUNT || !timerActiveByButton[idx]) {
     return 0;
   }
-  const unsigned long deltaMs = now - timerElapsedBaseAtMsByButton[idx];
+  const long deltaSigned = static_cast<long>(now - timerElapsedBaseAtMsByButton[idx]);
+  const unsigned long deltaMs = deltaSigned < 0 ? 0UL : static_cast<unsigned long>(deltaSigned);
   const uint64_t elapsed64 = timerElapsedBaseMsByButton[idx] + static_cast<uint64_t>(deltaMs);
   return elapsed64 > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : static_cast<unsigned long>(elapsed64);
 }
@@ -319,42 +325,42 @@ void handleRoot() {
   String escapedPassword = htmlEscape(String(cfg.password));
   String escapedApiHost = htmlEscape(String(cfg.apiHost));
   String escapedBearerToken = htmlEscape(String(cfg.bearerToken));
-
-  configServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  configServer.send(200, "text/html", "");
-
-  configServer.sendContent(F("<!doctype html><html><head><meta charset='utf-8'><title>Remote Timer</title></head><body>"));
-  configServer.sendContent(F("<h3>Remote Timer</h3>"));
-  configServer.sendContent(F("<p>Status: "));
-  configServer.sendContent(escapedStatus);
-  configServer.sendContent(F("</p>"));
+  String page;
+  page.reserve(2000);
+  page += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
+  page += F("<title>Remote Timer</title></head><body style='font-family:sans-serif;font-size:1.05rem;line-height:1.45;margin:0;padding:0.85rem;'><main>");
+  page += F("<h3>Remote Timer</h3>");
+  page += F("<p>Status: ");
+  page += escapedStatus;
+  page += F("</p>");
   if (WiFi.status() == WL_CONNECTED) {
-    configServer.sendContent(F("<p>WiFi: "));
-    configServer.sendContent(htmlEscape(WiFi.SSID()));
-    configServer.sendContent(F(" "));
-    configServer.sendContent(WiFi.localIP().toString());
-    configServer.sendContent(F("</p>"));
+    page += F("<p>WiFi: ");
+    page += htmlEscape(WiFi.SSID());
+    page += F(" ");
+    page += WiFi.localIP().toString();
+    page += F("</p>");
   } else {
-    configServer.sendContent(F("<p>WiFi: not connected</p>"));
+    page += F("<p>WiFi: not connected</p>");
   }
 
-  configServer.sendContent(F("<form method='POST' action='/save'>"));
-  configServer.sendContent(F("SSID<br><input name='ssid' maxlength='32' value='"));
-  configServer.sendContent(escapedSsid);
-  configServer.sendContent(F("'><br>"));
-  configServer.sendContent(F("Password<br><input type='password' name='password' maxlength='64' value='"));
-  configServer.sendContent(escapedPassword);
-  configServer.sendContent(F("'><br>"));
-  configServer.sendContent(F("API Host (host:port)<br><input name='api_host' maxlength='128' value='"));
-  configServer.sendContent(escapedApiHost);
-  configServer.sendContent(F("'><br>"));
-  configServer.sendContent(F("API Token (optional)<br><input type='password' name='api_token' maxlength='128' value='"));
-  configServer.sendContent(escapedBearerToken);
-  configServer.sendContent(F("'><br><br>"));
-  configServer.sendContent(F("<button type='submit'>Save</button></form>"));
-  configServer.sendContent(F("<p><a href='/debug'>debug</a></p>"));
-  configServer.sendContent(F("</body></html>"));
-  configServer.sendContent("");
+  page += F("<form method='POST' action='/save'>");
+  page += F("<label>SSID<br><input style='font-size:1rem;width:100%;' name='ssid' maxlength='32' value='");
+  page += escapedSsid;
+  page += F("'></label>");
+  page += F("<br><label>Password<br><input style='font-size:1rem;width:100%;' type='password' name='password' maxlength='64' value='");
+  page += escapedPassword;
+  page += F("'></label>");
+  page += F("<br><label>API Host (host:port)<br><input style='font-size:1rem;width:100%;' name='api_host' maxlength='128' value='");
+  page += escapedApiHost;
+  page += F("'></label>");
+  page += F("<br><label>API Token (optional)<br><input style='font-size:1rem;width:100%;' type='password' name='api_token' maxlength='128' value='");
+  page += escapedBearerToken;
+  page += F("'></label>");
+  page += F("<br><button style='font-size:1rem;' type='submit'>Save</button></form>");
+  page += F("<p><a href='/debug'>debug</a></p>");
+  page += F("</main></body></html>");
+
+  configServer.send(200, "text/html", page);
 }
 
 void copyFormField(const String& value, char* target, size_t maxSize) {
@@ -376,9 +382,9 @@ void handleSave() {
   }
 
   saveConfig();
-  beginWiFiConnect();
-
   configServer.send(200, "text/html", F("<h2>Saved</h2><p>WiFi reconnect started. Check status on the main page.</p><a href='/'>Back</a>"));
+  wifiReconnectRequested = true;
+  wifiReconnectAt = millis() + 800UL;
 }
 
 void handleDebug() {
@@ -399,6 +405,8 @@ void handleDebug() {
         + " after=" + String(alertAfterMsByButton[i])
         + " interval=" + String(alertIntervalMsByButton[i])
         + " idx=" + String(lastAlertIndex[i])
+        + " actionTone=" + String(actionToneEnqueueCountByButton[i])
+        + " alertTone=" + String(alertToneEnqueueCountByButton[i])
         + "\n";
   }
 
@@ -511,7 +519,22 @@ bool enqueueTonePattern(uint8_t buttonIndex, bool isLongPress, uint8_t beepCount
   pattern.toneMs = TONE_MS;
   pattern.gapMs = TONE_GAP_MS;
 
-  return xQueueSend(toneQueue, &pattern, 0) == pdTRUE;
+  const bool ok = xQueueSend(toneQueue, &pattern, 0) == pdTRUE;
+  if (ok) {
+    actionToneEnqueueCountByButton[buttonIndex]++;
+    Serial.print("ENQ tone action b");
+    Serial.print(static_cast<unsigned>(buttonIndex + 1));
+    Serial.print(" type=");
+    Serial.print(isLongPress ? "long" : "short");
+    Serial.print(" beeps=");
+    Serial.print(static_cast<unsigned>(beepCount));
+    Serial.print(" freq=");
+    Serial.println(static_cast<unsigned>(pattern.frequency));
+  } else {
+    Serial.print("ENQ tone action FAILED b");
+    Serial.println(static_cast<unsigned>(buttonIndex + 1));
+  }
+  return ok;
 }
 
 bool enqueueAlertTonePattern(uint8_t buttonIndex) {
@@ -525,7 +548,26 @@ bool enqueueAlertTonePattern(uint8_t buttonIndex) {
   pattern.toneMs = ALERT_TONE_MS;
   pattern.gapMs = ALERT_TONE_GAP_MS;
 
-  return xQueueSend(toneQueue, &pattern, 0) == pdTRUE;
+  const bool ok = xQueueSend(toneQueue, &pattern, 0) == pdTRUE;
+  if (ok) {
+    alertToneEnqueueCountByButton[buttonIndex]++;
+    Serial.print("ENQ tone alert b");
+    Serial.print(static_cast<unsigned>(buttonIndex + 1));
+    Serial.print(" beeps=");
+    Serial.print(static_cast<unsigned>(pattern.beepsRemaining));
+    Serial.print(" freq=");
+    Serial.print(static_cast<unsigned>(pattern.frequency));
+    Serial.print(" elapsed=");
+    Serial.print(effectiveElapsedMs(buttonIndex, millis()));
+    Serial.print(" after=");
+    Serial.print(alertAfterMsByButton[buttonIndex]);
+    Serial.print(" interval=");
+    Serial.println(alertIntervalMsByButton[buttonIndex]);
+  } else {
+    Serial.print("ENQ tone alert FAILED b");
+    Serial.println(static_cast<unsigned>(buttonIndex + 1));
+  }
+  return ok;
 }
 
 void enqueueStartupToneSeries() {
@@ -863,7 +905,10 @@ void pollDeviceState(unsigned long now) {
 
   if (!deviceStateLoaded) {
     deviceStateLoaded = true;
-    queueLoadedTimerTones();
+    if (!loadedTimerTonesPlayedThisBoot) {
+      loadedTimerTonesPlayedThisBoot = true;
+      queueLoadedTimerTones();
+    }
     setStatus("Loaded device alert state");
   }
 }
@@ -940,8 +985,13 @@ void loop() {
   unsigned long now = millis();
 
   configServer.handleClient();
+  if (wifiReconnectRequested && (long)(now - wifiReconnectAt) >= 0) {
+    wifiReconnectRequested = false;
+    beginWiFiConnect();
+  }
   updateButtons();
   pollDeviceState(now);
+  now = millis();
   updateLocalAlerts(now);
   flushLoadedTimerToneQueue(now);
   updateTone(now);

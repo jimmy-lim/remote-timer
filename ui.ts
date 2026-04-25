@@ -743,6 +743,11 @@ const html = `<!doctype html>
       });
 
       deleteAllButton.addEventListener("click", async () => {
+        const confirmed = window.confirm(
+          "Delete all timers?\n\nThis will also delete all enriched data (label, notes, alert settings, muted, order) for every timer."
+        );
+        if (!confirmed) return;
+
         try {
           const response = await fetch("/api/timers", {
             method: "DELETE"

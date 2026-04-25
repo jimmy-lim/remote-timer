@@ -196,7 +196,6 @@ Bun.serve({
 
       const store = await readStore();
       delete store.timers[timerId];
-      delete store.enrich[timerId];
       await writeStore(store);
 
       return new Response(null, { status: 204 });
