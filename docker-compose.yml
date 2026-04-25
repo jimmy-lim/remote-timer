@@ -1,0 +1,16 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      API_PORT: "3001"
+      UI_PORT: "3000"
+      DATA_PATH: "/data/timer-data.json"
+      API_BASE_URL: "http://127.0.0.1:3001"
+    volumes:
+      - ./data:/data
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+    restart: unless-stopped

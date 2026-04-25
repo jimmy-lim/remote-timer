@@ -1,15 +1,25 @@
+export {};
+
 const PORT = Number(process.env.PORT || 3001);
 const DATA_PATH = process.env.DATA_PATH || "./timer-data.json";
 
 type Store = {
   timers: Record<string, number>;
-  labels: Record<string, string>;
+  enrich: Record<string, TimerEnrich>;
 };
 
-type LabelEntry = {
-  id: string;
-  label: string;
+type TimerEnrich = {
+  label?: string;
+  notes?: string;
+  alertAfter?: string;
+  alertInterval?: string;
+  muted?: boolean;
+  order?: string;
 };
+
+type EnrichEntry = {
+  id: string;
+} & TimerEnrich;
 
 function jsonResponse(data: unknown, init?: ResponseInit) {
   return new Response(JSON.stringify(data), {
@@ -25,7 +35,7 @@ async function readStore(): Promise<Store> {
   try {
     const file = Bun.file(DATA_PATH);
     if (!(await file.exists())) {
-      return { timers: {}, labels: {} };
+      return { timers: {}, enrich: {} };
     }
 
     const parsed = JSON.parse(await file.text());
@@ -33,30 +43,69 @@ async function readStore(): Promise<Store> {
       parsed && typeof parsed === "object" && parsed.timers && typeof parsed.timers === "object"
         ? parsed.timers
         : {};
-    const labels =
-      parsed && typeof parsed === "object" && parsed.labels && typeof parsed.labels === "object"
-        ? parsed.labels
+    const enrichRaw =
+      parsed && typeof parsed === "object" && parsed.enrich && typeof parsed.enrich === "object"
+        ? parsed.enrich
         : {};
 
     return {
       timers: Object.fromEntries(
         Object.entries(timers)
           .filter(([id]) => typeof id === "string")
-          .map(([id, timestamp]) => [id, Number(timestamp) || 0])
+          .map(([id, value]) => [id, sanitizeTimerTimestamp(value)])
       ),
-      labels: Object.fromEntries(
-        Object.entries(labels)
+      enrich: Object.fromEntries(
+        Object.entries(enrichRaw)
           .filter(([id]) => typeof id === "string")
-          .map(([id, label]) => [id, typeof label === "string" ? label : ""])
+          .map(([id, value]) => [
+            id,
+            sanitizeTimerEnrich(value)
+          ])
       )
     };
   } catch {
-    return { timers: {}, labels: {} };
+    return { timers: {}, enrich: {} };
   }
 }
 
 async function writeStore(store: Store) {
   await Bun.write(DATA_PATH, JSON.stringify(store, null, 2) + "\n");
+}
+
+function sanitizeTimerTimestamp(value: unknown): number {
+  if (typeof value === "number") {
+    return Number(value) || 0;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return 0;
+  }
+  const raw = value as Record<string, unknown>;
+  return Number(raw.timestamp) || 0;
+}
+
+function sanitizeOrder(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return String(Math.trunc(value));
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  return /^[0-9]+$/.test(trimmed) ? trimmed : undefined;
+}
+
+function sanitizeTimerEnrich(value: unknown): TimerEnrich {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+
+  const raw = value as Record<string, unknown>;
+  const next: TimerEnrich = {};
+
+  if (typeof raw.label === "string") next.label = raw.label;
+  if (typeof raw.notes === "string") next.notes = raw.notes;
+  if (typeof raw.alertAfter === "string") next.alertAfter = raw.alertAfter;
+  if (typeof raw.alertInterval === "string") next.alertInterval = raw.alertInterval;
+  if (typeof raw.muted === "boolean") next.muted = raw.muted;
+  const order = sanitizeOrder(raw.order);
+  if (order !== undefined) next.order = order;
+
+  return next;
 }
 
 function timerEntries(timers: Record<string, number>) {
@@ -68,46 +117,31 @@ function timerEntries(timers: Record<string, number>) {
     }));
 }
 
-function labelEntries(labels: Record<string, string>): LabelEntry[] {
-  return Object.entries(labels).map(([id, label]) => ({ id, label }));
+function enrichEntries(enrich: Record<string, TimerEnrich>): EnrichEntry[] {
+  return Object.entries(enrich).map(([id, value]) => ({ id, ...value }));
 }
 
-function normalizePostedLabels(payload: unknown): LabelEntry[] {
+function normalizePostedEnrich(payload: unknown): EnrichEntry[] {
   if (!Array.isArray(payload)) return [];
-
-  if (
-    payload.length === 2 &&
-    payload[0] &&
-    typeof payload[0] === "object" &&
-    payload[1] &&
-    typeof payload[1] === "object" &&
-    typeof (payload[0] as Record<string, unknown>).id === "string" &&
-    typeof (payload[1] as Record<string, unknown>).label === "string"
-  ) {
-    return [
-      {
-        id: (payload[0] as Record<string, string>).id,
-        label: (payload[1] as Record<string, string>).label
-      }
-    ];
-  }
 
   return payload.flatMap((entry) => {
     if (!entry || typeof entry !== "object") return [];
 
-    const item = entry as Record<string, unknown>;
+    const item = { ...(entry as Record<string, unknown>) };
     if (typeof item.id !== "string") return [];
+    const { id } = item;
+    delete item.id;
 
     return [
       {
-        id: item.id,
-        label: typeof item.label === "string" ? item.label : ""
+        id,
+        ...sanitizeTimerEnrich(item)
       }
     ];
   });
 }
 
-function normalizeDeletedLabels(payload: unknown): string[] {
+function normalizeDeletedEnrich(payload: unknown): string[] {
   if (!Array.isArray(payload)) return [];
 
   return payload.flatMap((entry) => {
@@ -116,6 +150,25 @@ function normalizeDeletedLabels(payload: unknown): string[] {
     const item = entry as Record<string, unknown>;
     return typeof item.id === "string" ? [item.id] : [];
   });
+}
+
+function parseDurationToMs(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  const match = trimmed.match(/^([0-9]+)\s*([smhdw]|mo)$/i);
+  if (!match) return null;
+  const amount = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  const unit = match[2].toLowerCase();
+  const multipliers: Record<string, number> = {
+    s: 1000,
+    m: 60 * 1000,
+    h: 60 * 60 * 1000,
+    d: 24 * 60 * 60 * 1000,
+    w: 7 * 24 * 60 * 60 * 1000,
+    mo: 30 * 24 * 60 * 60 * 1000
+  };
+  return amount * multipliers[unit];
 }
 
 Bun.serve({
@@ -128,7 +181,6 @@ Bun.serve({
       if (!timerId) {
         return jsonResponse({ error: "Missing id query parameter" }, { status: 400 });
       }
-
       const store = await readStore();
       store.timers[timerId] = Date.now();
       await writeStore(store);
@@ -144,6 +196,7 @@ Bun.serve({
 
       const store = await readStore();
       delete store.timers[timerId];
+      delete store.enrich[timerId];
       await writeStore(store);
 
       return new Response(null, { status: 204 });
@@ -157,25 +210,26 @@ Bun.serve({
     if (url.pathname === "/api/timers" && request.method === "DELETE") {
       const store = await readStore();
       store.timers = {};
+      store.enrich = {};
       await writeStore(store);
 
       return new Response(null, { status: 204 });
     }
 
-    if (url.pathname === "/api/labels" && request.method === "GET") {
+    if (url.pathname === "/api/enrich" && request.method === "GET") {
       const store = await readStore();
-      return jsonResponse(labelEntries(store.labels));
+      return jsonResponse(enrichEntries(store.enrich));
     }
 
-    if (url.pathname === "/api/labels" && request.method === "POST") {
+    if (url.pathname === "/api/enrich" && request.method === "POST") {
       try {
         const payload = await request.json();
-        const entries = normalizePostedLabels(payload);
+        const entries = normalizePostedEnrich(payload);
 
         if (entries.length === 0) {
           return jsonResponse(
             {
-              error: "Expected an array of label mappings like [{\"id\":\"timer-1\",\"label\":\"Kitchen\"}]"
+              error: "Expected an array like [{\"id\":\"timer-1\",\"label\":\"Kitchen\"}]"
             },
             { status: 400 }
           );
@@ -183,23 +237,27 @@ Bun.serve({
 
         const store = await readStore();
         for (const entry of entries) {
-          store.labels[entry.id] = entry.label;
+          const { id, ...next } = entry;
+          store.enrich[id] = {
+            ...(store.enrich[id] || {}),
+            ...next
+          };
         }
         await writeStore(store);
 
-        return jsonResponse(labelEntries(store.labels));
+        return jsonResponse(enrichEntries(store.enrich));
       } catch (error) {
         return jsonResponse(
-          { error: "Failed to save labels", detail: String(error) },
+          { error: "Failed to save enrich data", detail: String(error) },
           { status: 400 }
         );
       }
     }
 
-    if (url.pathname === "/api/labels" && request.method === "DELETE") {
+    if (url.pathname === "/api/enrich" && request.method === "DELETE") {
       try {
         const payload = await request.json();
-        const ids = normalizeDeletedLabels(payload);
+        const ids = normalizeDeletedEnrich(payload);
 
         if (ids.length === 0) {
           return jsonResponse(
@@ -210,17 +268,42 @@ Bun.serve({
 
         const store = await readStore();
         for (const id of ids) {
-          delete store.labels[id];
+          delete store.enrich[id];
         }
         await writeStore(store);
 
-        return jsonResponse(labelEntries(store.labels));
+        return jsonResponse(enrichEntries(store.enrich));
       } catch (error) {
         return jsonResponse(
-          { error: "Failed to delete labels", detail: String(error) },
+          { error: "Failed to delete enrich data", detail: String(error) },
           { status: 400 }
         );
       }
+    }
+
+    if (url.pathname === "/api/device-state" && request.method === "GET") {
+      const suffix = (url.searchParams.get("id") || "").trim();
+      if (!suffix || suffix.includes("/") || suffix.includes(" ")) {
+        return new Response("Missing or invalid id query parameter\n", { status: 400 });
+      }
+
+      const store = await readStore();
+      const nowMs = Date.now();
+      const lines: string[] = [`now,${nowMs}`];
+
+      for (let button = 1; button <= 4; button++) {
+        const timerId = `${suffix}-${button}`;
+        const timestampMs = Number(store.timers[timerId] || 0);
+        const enrich = store.enrich[timerId];
+        const muted = enrich?.muted === true ? 1 : 0;
+        const alertAfterMs = parseDurationToMs(enrich?.alertAfter) ?? 0;
+        const alertIntervalMs = parseDurationToMs(enrich?.alertInterval) ?? 0;
+        lines.push(`${button},${timestampMs},${muted},${alertAfterMs},${alertIntervalMs}`);
+      }
+
+      return new Response(`${lines.join("\n")}\n`, {
+        headers: { "content-type": "text/plain; charset=utf-8" }
+      });
     }
 
     if (url.pathname === "/health") {
@@ -232,4 +315,4 @@ Bun.serve({
 });
 
 console.log(`Remote Timers API running on http://localhost:${PORT}`);
-console.log(`Persisting timers and labels in ${DATA_PATH}`);
+console.log(`Persisting timers and enrich data in ${DATA_PATH}`);
