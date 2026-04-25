@@ -256,12 +256,22 @@ const html = `<!doctype html>
 
         th[data-col="label"],
         td[data-col="label"] {
-          width: 68%;
+          width: 34%;
+        }
+
+        th[data-col="after"],
+        td[data-col="after"] {
+          width: 22%;
+        }
+
+        th[data-col="interval"],
+        td[data-col="interval"] {
+          width: 22%;
         }
 
         th[data-col="elapsed"],
         td[data-col="elapsed"] {
-          width: 32%;
+          width: 22%;
           text-align: right;
         }
       }
@@ -297,8 +307,8 @@ const html = `<!doctype html>
             <th class="mobile-hide">Order</th>
             <th data-col="label">Label</th>
             <th class="mobile-hide">Notes</th>
-            <th class="mobile-hide">Alert After</th>
-            <th class="mobile-hide">Alert Interval</th>
+            <th data-col="after">Alert After</th>
+            <th data-col="interval">Alert Interval</th>
             <th class="mobile-hide">Muted</th>
             <th class="mobile-hide non-edit-col">Updated At</th>
             <th class="non-edit-col" data-col="elapsed">Elapsed</th>
@@ -547,12 +557,12 @@ const html = `<!doctype html>
                 ? \`<input class="label-input enrich-input" data-timer-id="\${escapeHtml(row.id)}" data-field="notes" type="text" value="\${escapeHtml(state.editDraft[row.id]?.notes ?? row.notes ?? "")}" placeholder="Notes" />\`
                 : escapeHtml(row.notes || "-")}
             </td>
-            <td class="mobile-hide" data-label="Alert After">
+            <td data-col="after" data-label="Alert After">
               \${state.editMode
                 ? \`<input class="label-input enrich-input" data-timer-id="\${escapeHtml(row.id)}" data-field="alertAfter" type="text" value="\${escapeHtml(state.editDraft[row.id]?.alertAfter ?? row.alertAfter ?? "")}" placeholder="5m, 3h, 1d, 2mo" />\`
                 : escapeHtml(row.alertAfter || "-")}
             </td>
-            <td class="mobile-hide" data-label="Alert Interval">
+            <td data-col="interval" data-label="Alert Interval">
               \${state.editMode
                 ? \`<input class="label-input enrich-input" data-timer-id="\${escapeHtml(row.id)}" data-field="alertInterval" type="text" value="\${escapeHtml(state.editDraft[row.id]?.alertInterval ?? row.alertInterval ?? "")}" placeholder="5m, 1h, 1d" />\`
                 : escapeHtml(row.alertInterval || "-")}
