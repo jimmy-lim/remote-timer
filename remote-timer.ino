@@ -399,14 +399,10 @@ void handleDebug() {
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
     const unsigned long elapsedMs = effectiveElapsedMs(i, now);
     out += "b" + String(i + 1)
-        + " active=" + String(timerActiveByButton[i] ? 1 : 0)
         + " muted=" + String(alertMutedByButton[i] ? 1 : 0)
         + " elapsed=" + String(elapsedMs)
         + " after=" + String(alertAfterMsByButton[i])
         + " interval=" + String(alertIntervalMsByButton[i])
-        + " idx=" + String(lastAlertIndex[i])
-        + " actionTone=" + String(actionToneEnqueueCountByButton[i])
-        + " alertTone=" + String(alertToneEnqueueCountByButton[i])
         + "\n";
   }
 
