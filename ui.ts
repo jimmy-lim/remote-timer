@@ -621,7 +621,6 @@ const html = `<!doctype html>
                 const id = row.id ?? row.timerId ?? \`row-\${index + 1}\`;
                 return id !== timerId;
               });
-              delete state.enrich[timerId];
               delete state.editDraft[timerId];
               renderRows();
               errorEl.textContent = "";

@@ -1,104 +1,66 @@
-# Remote Timer (Bun)
+# Remote Timer
 
-Remote timer system with:
+## How to use
 
-- Bun API (`api.ts`) for timer state + enrich metadata
-- Bun UI (`ui.ts`) that proxies API calls
-- ESP32-C3 firmware (`remote-timer.ino`) that sends timer events
-
-Production Docker deployment runs API + UI in a single container.
-
-## API Routes (port 3001)
-
-- `POST /api/timer?id=<suffix>-<button>`
-- `DELETE /api/timer?id=<suffix>-<button>`
-- `GET /api/timers`
-- `DELETE /api/timers`
-- `GET /api/enrich`
-- `POST /api/enrich`
-- `DELETE /api/enrich`
-- `GET /api/device-state?id=<suffix>`
-- `GET /health`
-
-`/api/enrich` supports these properties per timer id:
-
-- `label` (string)
-- `notes` (string)
-- `alertAfter` (string duration, e.g. `5m`, `3h`, `1d`, `2mo`)
-- `muted` (boolean)
-- `order` (numeric string like `"1"`, `"2"`; rows sort by this when defined)
-
-Delete behavior:
-
-- `DELETE /api/timer?id=...` removes both timer state and matching enrich entry.
-- `DELETE /api/timers` clears all timers and all enrich entries.
-
-## Local Run (Bun)
-
-Requirements:
-
-- Bun installed
-
-Run API:
-
-```bash
-bun run api.ts
-```
-
-Run UI (new terminal):
-
-```bash
-bun run ui.ts
-```
-
-Open:
-
-- UI: `http://localhost:3000`
-- API health: `http://localhost:3001/health`
-
-## Docker / Portainer (Single Container)
-
-Use `compose.yml`:
+1. Start the app:
 
 ```bash
 docker compose up -d --build
 ```
 
-Open:
+2. Open the web UI:
 
-- UI: `http://<host-ip>:3000`
-- API: `http://<host-ip>:3001`
+- `http://<your-server-ip>:3000`
 
-Notes:
+3. Set up the device:
 
-- API and UI run together in one container/service (`app`).
-- API data persists in `./data/timer-data.json` via mounted volume.
-- `data/` is excluded from git and Docker build context.
+- Flash `remote-timer.ino` to your ESP32-C3.
+- Connect to device setup page: `http://192.168.4.1`
+- Enter:
+  - Wi-Fi name and password
+  - API host (example: `192.168.1.42:3001`)
+  - API token (optional)
+- Save.
 
-## ESP32 Firmware
+4. Use the remote buttons:
 
-File: `remote-timer.ino`
+- Short press: start/update timer
+- Long press: delete timer
 
-In config portal (`http://192.168.4.1`), set:
+5. Use the UI:
 
-- Wi-Fi SSID/password
-- API host (`host:port`), for example `192.168.1.42:3001`
-- Optional bearer token
+- Edit label, notes, alert settings, mute, and order
+- Save changes
+- Delete single timer (keeps that timer’s settings)
+- Delete all timers (also removes all settings)
 
-Firmware constructs endpoint automatically as:
+## Notes
 
-- `http://<api-host>/api/timer?id=<suffix>-<button>`
+- Keep device and server on the same network.
+- Data is saved and will remain after restart if your Docker volume is persistent.
 
-Behavior:
+## Simple Wiring Diagram
 
-- Short press: `POST`
-- Long press: `DELETE`
-- Device polls `/api/device-state?id=<suffix>` every 60s for alert config/timer state refresh.
+### ESP32-C3 + YK04
 
-## Repo Layout
+```
+YK04 receiver                 ESP32-C3
+-------------                ----------
+VCC         ----------------> 3V3
+GND         ----------------> GND
+D0 (Button1) ----------------> GPIO0
+D1 (Button2) ----------------> GPIO1
+D2 (Button3) ----------------> GPIO3
+D3 (Button4) ----------------> GPIO4
+```
 
-- `api.ts` - Bun API server
-- `ui.ts` - Bun UI + proxy server
-- `remote-timer.ino` - ESP32 firmware
-- `compose.yml` - Docker Compose deployment
-- `Dockerfile` - Bun runtime image
+### Buzzer
+
+```
+Buzzer                       ESP32-C3
+------                       ----------
++ (positive) ---------------> GPIO10
+- (negative) ---------------> GND
+```
+
+Pin map above matches current firmware defaults in `remote-timer.ino`.
