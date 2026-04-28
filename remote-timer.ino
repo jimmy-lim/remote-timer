@@ -7,9 +7,11 @@
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
+#include <ctype.h>
 #include <stdlib.h>
+#include <string.h>
 
-#define LED_PIN 8
+constexpr uint8_t LED_PIN = 8;
 unsigned long lastLedToggle = 0;
 bool ledState = false;
 
@@ -140,6 +142,45 @@ static int32_t alertIndexForElapsed(unsigned long elapsedMs, unsigned long alert
   return static_cast<int32_t>((elapsedMs - alertAfterMs) / alertIntervalMs);
 }
 
+static unsigned long nextBeepElapsedMs(unsigned long elapsedMs, unsigned long alertAfterMs, unsigned long alertIntervalMs) {
+  if (alertAfterMs == 0) {
+    return 0;
+  }
+  if (elapsedMs < alertAfterMs) {
+    return alertAfterMs;
+  }
+  if (alertIntervalMs == 0) {
+    return 0;
+  }
+
+  const unsigned long intervalsElapsed = (elapsedMs - alertAfterMs) / alertIntervalMs;
+  const uint64_t nextBeepMs64 = static_cast<uint64_t>(alertAfterMs)
+    + static_cast<uint64_t>(intervalsElapsed + 1UL) * static_cast<uint64_t>(alertIntervalMs);
+  return nextBeepMs64 > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : static_cast<unsigned long>(nextBeepMs64);
+}
+
+static unsigned long nextBeepInMs(unsigned long elapsedMs, unsigned long alertAfterMs, unsigned long alertIntervalMs) {
+  const unsigned long nextElapsedMs = nextBeepElapsedMs(elapsedMs, alertAfterMs, alertIntervalMs);
+  if (nextElapsedMs == 0 || nextElapsedMs <= elapsedMs) {
+    return 0;
+  }
+  return nextElapsedMs - elapsedMs;
+}
+
+static String secondsString(unsigned long ms) {
+  return String((ms + 500UL) / 1000UL);
+}
+
+static unsigned long roundedSeconds(unsigned long ms) {
+  return (ms + 500UL) / 1000UL;
+}
+
+static void appendUnsigned(String& out, unsigned long value) {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%lu", value);
+  out += buf;
+}
+
 static void setStatus(const String& s) {
   if (statusMutex != nullptr) {
     xSemaphoreTake(statusMutex, portMAX_DELAY);
@@ -163,43 +204,83 @@ static String getStatusLine() {
   return current;
 }
 
-static String htmlEscape(const String& value) {
-  String escaped;
-  escaped.reserve(value.length() + 16);
-  for (size_t i = 0; i < value.length(); ++i) {
-    char c = value.charAt(i);
-    switch (c) {
+static void appendHtmlEscaped(String& out, const char* value) {
+  if (value == nullptr) {
+    return;
+  }
+
+  for (const char* p = value; *p != '\0'; ++p) {
+    switch (*p) {
       case '&':
-        escaped += "&amp;";
+        out += F("&amp;");
         break;
       case '<':
-        escaped += "&lt;";
+        out += F("&lt;");
         break;
       case '>':
-        escaped += "&gt;";
+        out += F("&gt;");
         break;
       case '"':
-        escaped += "&quot;";
+        out += F("&quot;");
         break;
       case '\'':
-        escaped += "&#39;";
+        out += F("&#39;");
         break;
       default:
-        escaped += c;
+        out += *p;
         break;
     }
   }
+}
+
+static String htmlEscape(const String& value) {
+  String escaped;
+  escaped.reserve(value.length() + 16);
+  appendHtmlEscaped(escaped, value.c_str());
   return escaped;
 }
 
-static uint64_t parseUint64(const String& value) {
-  const char* s = value.c_str();
+static uint64_t parseUint64(const char* s) {
   char* end = nullptr;
   unsigned long long n = strtoull(s, &end, 10);
   if (end == s) {
     return 0;
   }
   return static_cast<uint64_t>(n);
+}
+
+static uint64_t parseUint64(const String& value) {
+  return parseUint64(value.c_str());
+}
+
+static long parseLong(const char* s) {
+  char* end = nullptr;
+  long n = strtol(s, &end, 10);
+  if (end == s) {
+    return 0;
+  }
+  return n;
+}
+
+static void trimInPlace(char* s) {
+  if (s == nullptr) {
+    return;
+  }
+
+  char* start = s;
+  while (*start != '\0' && isspace(static_cast<unsigned char>(*start))) {
+    start++;
+  }
+
+  char* end = start + strlen(start);
+  while (end > start && isspace(static_cast<unsigned char>(*(end - 1)))) {
+    end--;
+  }
+  *end = '\0';
+
+  if (start != s) {
+    memmove(s, start, static_cast<size_t>(end - start) + 1U);
+  }
 }
 
 static String apiBaseFromHost(const String& apiHost) {
@@ -320,22 +401,19 @@ void updateWiFiConnection(unsigned long now) {
 }
 
 void handleRoot() {
-  String escapedStatus = htmlEscape(getStatusLine());
-  String escapedSsid = htmlEscape(String(cfg.ssid));
-  String escapedPassword = htmlEscape(String(cfg.password));
-  String escapedApiHost = htmlEscape(String(cfg.apiHost));
-  String escapedBearerToken = htmlEscape(String(cfg.bearerToken));
+  String status = getStatusLine();
   String page;
   page.reserve(2000);
   page += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   page += F("<title>Remote Timer</title></head><body style='font-family:sans-serif;font-size:1.05rem;line-height:1.45;margin:0;padding:0.85rem;'><main>");
   page += F("<h3>Remote Timer</h3>");
   page += F("<p>Status: ");
-  page += escapedStatus;
+  appendHtmlEscaped(page, status.c_str());
   page += F("</p>");
   if (WiFi.status() == WL_CONNECTED) {
+    String wifiSsid = WiFi.SSID();
     page += F("<p>WiFi: ");
-    page += htmlEscape(WiFi.SSID());
+    appendHtmlEscaped(page, wifiSsid.c_str());
     page += F(" ");
     page += WiFi.localIP().toString();
     page += F("</p>");
@@ -345,16 +423,16 @@ void handleRoot() {
 
   page += F("<form method='POST' action='/save'>");
   page += F("<label>SSID<br><input style='font-size:1rem;width:100%;' name='ssid' maxlength='32' value='");
-  page += escapedSsid;
+  appendHtmlEscaped(page, cfg.ssid);
   page += F("'></label>");
   page += F("<br><label>Password<br><input style='font-size:1rem;width:100%;' type='password' name='password' maxlength='64' value='");
-  page += escapedPassword;
+  appendHtmlEscaped(page, cfg.password);
   page += F("'></label>");
   page += F("<br><label>API Host (host:port)<br><input style='font-size:1rem;width:100%;' name='api_host' maxlength='128' value='");
-  page += escapedApiHost;
+  appendHtmlEscaped(page, cfg.apiHost);
   page += F("'></label>");
   page += F("<br><label>API Token (optional)<br><input style='font-size:1rem;width:100%;' type='password' name='api_token' maxlength='128' value='");
-  page += escapedBearerToken;
+  appendHtmlEscaped(page, cfg.bearerToken);
   page += F("'></label>");
   page += F("<br><button style='font-size:1rem;' type='submit'>Save</button></form>");
   page += F("<p><a href='/debug'>debug</a></p>");
@@ -389,21 +467,48 @@ void handleSave() {
 
 void handleDebug() {
   const unsigned long now = millis();
+  const unsigned long freeHeap = ESP.getFreeHeap();
+  const unsigned long minFreeHeap = ESP.getMinFreeHeap();
+  const unsigned long maxAllocHeap = ESP.getMaxAllocHeap();
+  const unsigned long fragPct = freeHeap == 0
+    ? 0UL
+    : 100UL - ((maxAllocHeap * 100UL) / freeHeap);
   String out;
-  out.reserve(448);
-  out += "nowMs=" + String(now)
-      + " loaded=" + String(deviceStateLoaded ? 1 : 0)
-      + " lastPollMs=" + String(lastDeviceStateFetchAttempt)
-      + "\n";
+  out.reserve(768);
+  out += F("nowMs=");
+  appendUnsigned(out, now);
+  out += F(" loaded=");
+  out += deviceStateLoaded ? '1' : '0';
+  out += F(" lastPollMs=");
+  appendUnsigned(out, lastDeviceStateFetchAttempt);
+  out += F(" freeHeap=");
+  appendUnsigned(out, freeHeap);
+  out += F(" minFreeHeap=");
+  appendUnsigned(out, minFreeHeap);
+  out += F(" maxAllocHeap=");
+  appendUnsigned(out, maxAllocHeap);
+  out += F(" fragPct=");
+  appendUnsigned(out, fragPct);
+  out += '\n';
 
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
     const unsigned long elapsedMs = effectiveElapsedMs(i, now);
-    out += "b" + String(i + 1)
-        + " muted=" + String(alertMutedByButton[i] ? 1 : 0)
-        + " elapsed=" + String(elapsedMs)
-        + " after=" + String(alertAfterMsByButton[i])
-        + " interval=" + String(alertIntervalMsByButton[i])
-        + "\n";
+    const unsigned long nextBeepMs = (!timerActiveByButton[i] || alertMutedByButton[i])
+      ? 0UL
+      : nextBeepInMs(elapsedMs, alertAfterMsByButton[i], alertIntervalMsByButton[i]);
+    out += 'b';
+    out += static_cast<char>('1' + i);
+    out += F(" muted=");
+    out += alertMutedByButton[i] ? '1' : '0';
+    out += F(" elapsed=");
+    appendUnsigned(out, roundedSeconds(elapsedMs));
+    out += F(" after=");
+    appendUnsigned(out, roundedSeconds(alertAfterMsByButton[i]));
+    out += F(" interval=");
+    appendUnsigned(out, roundedSeconds(alertIntervalMsByButton[i]));
+    out += F(" nextBeep=");
+    appendUnsigned(out, roundedSeconds(nextBeepMs));
+    out += '\n';
   }
 
   configServer.send(200, "text/plain", out);
@@ -799,92 +904,104 @@ void pollDeviceState(unsigned long now) {
     return;
   }
 
-  String body = http.getString();
-  http.end();
-
   const bool suppressInitialDueBeeps = !deviceStateLoaded;
   uint64_t nowEpochMs = 0;
   bool seenButton[BUTTON_COUNT] = {false, false, false, false};
-
-  int lineStart = 0;
-  while (lineStart < body.length()) {
-    int lineEnd = body.indexOf('\n', lineStart);
-    if (lineEnd < 0) {
-      lineEnd = body.length();
-    }
-
-    String line = body.substring(lineStart, lineEnd);
-    line.trim();
-    if (line.length() > 0) {
-      int c1 = line.indexOf(',');
-      if (c1 > 0) {
-        String head = line.substring(0, c1);
-        if (head == "now") {
-          nowEpochMs = parseUint64(line.substring(c1 + 1));
-        } else {
-          int c2 = line.indexOf(',', c1 + 1);
-          int c3 = c2 > 0 ? line.indexOf(',', c2 + 1) : -1;
-          int c4 = c3 > 0 ? line.indexOf(',', c3 + 1) : -1;
-          if (c2 > 0 && c3 > 0 && c4 > 0) {
-            const int button = head.toInt();
-            if (button >= 1 && button <= static_cast<int>(BUTTON_COUNT)) {
-              const uint8_t idx = static_cast<uint8_t>(button - 1);
-              const uint64_t timestampMs = parseUint64(line.substring(c1 + 1, c2));
-              const int mutedInt = line.substring(c2 + 1, c3).toInt();
-              const unsigned long alertAfterMs = static_cast<unsigned long>(parseUint64(line.substring(c3 + 1, c4)));
-              const unsigned long alertIntervalMs = static_cast<unsigned long>(parseUint64(line.substring(c4 + 1)));
-
-              alertMutedByButton[idx] = mutedInt != 0;
-              alertAfterMsByButton[idx] = alertAfterMs;
-              alertIntervalMsByButton[idx] = alertIntervalMs;
-
-              if (alertMutedByButton[idx]) {
-                // Fully drop muted timers from local processing.
-                timerActiveByButton[idx] = false;
-                timerElapsedBaseMsByButton[idx] = 0;
-                timerElapsedBaseAtMsByButton[idx] = 0;
-                timerEpochMsByButton[idx] = 0;
-                lastAlertIndex[idx] = -1;
-                seenButton[idx] = true;
-                continue;
-              }
-
-              if (timestampMs > 0 && nowEpochMs > 0 && nowEpochMs >= timestampMs) {
-                const bool timerChanged = timerEpochMsByButton[idx] != timestampMs;
-                timerEpochMsByButton[idx] = timestampMs;
-                const uint64_t elapsedMs64 = nowEpochMs - timestampMs;
-                const unsigned long nowMs = millis();
-                timerActiveByButton[idx] = true;
-                timerElapsedBaseMsByButton[idx] = elapsedMs64;
-                timerElapsedBaseAtMsByButton[idx] = nowMs;
-
-                if (suppressInitialDueBeeps) {
-                  const unsigned long elapsedMs =
-                    elapsedMs64 > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : static_cast<unsigned long>(elapsedMs64);
-                  // On first load, seed alert index from current elapsed to avoid immediate overdue beeps.
-                  lastAlertIndex[idx] = alertIndexForElapsed(elapsedMs, alertAfterMs, alertIntervalMs);
-                } else if (timerChanged) {
-                  // On a newly observed timer timestamp, reset alert index so the next
-                  // local tick can trigger the first due alert beep at/after alertAfter.
-                  lastAlertIndex[idx] = -1;
-                }
-              } else {
-                timerActiveByButton[idx] = false;
-                timerElapsedBaseMsByButton[idx] = 0;
-                timerElapsedBaseAtMsByButton[idx] = 0;
-                timerEpochMsByButton[idx] = 0;
-                lastAlertIndex[idx] = -1;
-              }
-
-              seenButton[idx] = true;
-            }
-          }
-        }
+  WiFiClient* stream = http.getStreamPtr();
+  char line[160];
+  while (stream != nullptr && (stream->connected() || stream->available())) {
+    const size_t len = stream->readBytesUntil('\n', line, sizeof(line) - 1U);
+    if (len == 0) {
+      if (!stream->available()) {
+        break;
       }
+      continue;
     }
 
-    lineStart = lineEnd + 1;
+    line[len] = '\0';
+    trimInPlace(line);
+    if (line[0] == '\0') {
+      continue;
+    }
+
+    char* c1 = strchr(line, ',');
+    if (c1 == nullptr || c1 == line) {
+      continue;
+    }
+    *c1 = '\0';
+
+    if (strcmp(line, "now") == 0) {
+      nowEpochMs = parseUint64(c1 + 1);
+      continue;
+    }
+
+    char* c2 = strchr(c1 + 1, ',');
+    char* c3 = c2 != nullptr ? strchr(c2 + 1, ',') : nullptr;
+    char* c4 = c3 != nullptr ? strchr(c3 + 1, ',') : nullptr;
+    if (c2 == nullptr || c3 == nullptr || c4 == nullptr) {
+      continue;
+    }
+
+    *c2 = '\0';
+    *c3 = '\0';
+    *c4 = '\0';
+
+    const long button = parseLong(line);
+    if (button < 1 || button > static_cast<long>(BUTTON_COUNT)) {
+      continue;
+    }
+
+    const uint8_t idx = static_cast<uint8_t>(button - 1);
+    const uint64_t timestampMs = parseUint64(c1 + 1);
+    const int mutedInt = static_cast<int>(parseLong(c2 + 1));
+    const unsigned long alertAfterMs = static_cast<unsigned long>(parseUint64(c3 + 1));
+    const unsigned long alertIntervalMs = static_cast<unsigned long>(parseUint64(c4 + 1));
+
+    alertMutedByButton[idx] = mutedInt != 0;
+    alertAfterMsByButton[idx] = alertAfterMs;
+    alertIntervalMsByButton[idx] = alertIntervalMs;
+
+    if (alertMutedByButton[idx]) {
+      // Fully drop muted timers from local processing.
+      timerActiveByButton[idx] = false;
+      timerElapsedBaseMsByButton[idx] = 0;
+      timerElapsedBaseAtMsByButton[idx] = 0;
+      timerEpochMsByButton[idx] = 0;
+      lastAlertIndex[idx] = -1;
+      seenButton[idx] = true;
+      continue;
+    }
+
+    if (timestampMs > 0 && nowEpochMs > 0 && nowEpochMs >= timestampMs) {
+      const bool timerChanged = timerEpochMsByButton[idx] != timestampMs;
+      timerEpochMsByButton[idx] = timestampMs;
+      const uint64_t elapsedMs64 = nowEpochMs - timestampMs;
+      const unsigned long nowMs = millis();
+      timerActiveByButton[idx] = true;
+      timerElapsedBaseMsByButton[idx] = elapsedMs64;
+      timerElapsedBaseAtMsByButton[idx] = nowMs;
+
+      if (suppressInitialDueBeeps) {
+        const unsigned long elapsedMs =
+          elapsedMs64 > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : static_cast<unsigned long>(elapsedMs64);
+        // On first load, seed alert index from current elapsed to avoid immediate overdue beeps.
+        lastAlertIndex[idx] = alertIndexForElapsed(elapsedMs, alertAfterMs, alertIntervalMs);
+      } else if (timerChanged) {
+        // On a newly observed timer timestamp, reset alert index so the next
+        // local tick can trigger the first due alert beep at/after alertAfter.
+        lastAlertIndex[idx] = -1;
+      }
+    } else {
+      timerActiveByButton[idx] = false;
+      timerElapsedBaseMsByButton[idx] = 0;
+      timerElapsedBaseAtMsByButton[idx] = 0;
+      timerEpochMsByButton[idx] = 0;
+      lastAlertIndex[idx] = -1;
+    }
+
+    seenButton[idx] = true;
   }
+  http.end();
 
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
     if (!seenButton[i]) {
