@@ -864,6 +864,10 @@ Bun.serve({
   port: PORT,
   async fetch(request, server) {
     const url = new URL(request.url);
+    const clientIp = getClientIp(request, server);
+    console.log(
+      `[ui] ${request.method} ${url.pathname} ip=${clientIp || "unknown"} xff=${request.headers.get("x-forwarded-for") || "-"} xri=${request.headers.get("x-real-ip") || "-"}`
+    );
 
     if (url.pathname === "/api/timers") {
       if (request.method === "DELETE") {
@@ -954,8 +958,6 @@ Bun.serve({
     }
 
     if (url.pathname === "/") {
-      const clientIp = getClientIp(request, server);
-      console.log(`[ui] client ip: ${clientIp || "unknown"}`);
       const canDeleteActions = canDeleteForClientIp(clientIp);
       const page = html.replace("__CAN_DELETE_ACTIONS__", canDeleteActions ? "true" : "false");
       return new Response(page, {
