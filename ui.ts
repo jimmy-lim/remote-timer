@@ -222,6 +222,10 @@ const html = `<!doctype html>
         padding: 8px 10px;
       }
 
+      .timer-delete-col {
+        display: none;
+      }
+
       .danger {
         background: #8c2a2a;
       }
@@ -320,9 +324,9 @@ const html = `<!doctype html>
       </section>
 
       <div class="actions">
-        <span id="proxy-target-hint" class="hint">Proxy target: <code>${TIMERS_URL}</code></span>
-        <button id="delete-all-button" class="danger" type="button">Delete All Timers</button>
-        <button id="edit-button" type="button">Edit</button>
+        <span id="proxy-target-hint" class="hint" style="display:none">Proxy target: <code>${TIMERS_URL}</code></span>
+        <button id="delete-all-button" class="danger" type="button" style="display:none">Delete All Timers</button>
+        <button id="edit-button" type="button" style="display:none">Edit</button>
         <button id="save-button" type="button" style="display:none">Save</button>
         <button id="cancel-button" type="button" style="display:none">Cancel</button>
       </div>
