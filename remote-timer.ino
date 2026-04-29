@@ -387,9 +387,7 @@ void updateWiFiConnection(unsigned long now) {
   wl_status_t status = WiFi.status();
   if (status == WL_CONNECTED) {
     wifiConnectInProgress = false;
-    char msg[48];
-    snprintf(msg, sizeof(msg), "WiFi connected: %s", WiFi.localIP().toString().c_str());
-    setStatus(msg);
+    setStatus("WiFi connected");
     return;
   }
 
