@@ -12,6 +12,10 @@ const TIMER_URL =
 const ENRICH_URL =
   process.env.ENRICH_URL ||
   `${API_BASE_URL.replace(/\/$/, "")}/api/enrich`;
+const UI_ALLOWED_IPS = (process.env.UI_ALLOWED_IPS || "")
+  .split(",")
+  .map((part) => part.trim())
+  .filter(Boolean);
 
 const html = `<!doctype html>
 <html lang="en">
@@ -312,7 +316,7 @@ const html = `<!doctype html>
             <th class="mobile-hide">Muted</th>
             <th class="mobile-hide non-edit-col">Updated At</th>
             <th class="non-edit-col" data-col="elapsed">Elapsed</th>
-            <th class="mobile-hide non-edit-col">Timer</th>
+            <th class="mobile-hide non-edit-col timer-delete-col">Timer</th>
           </tr>
         </thead>
         <tbody id="rows">
@@ -332,6 +336,7 @@ const html = `<!doctype html>
         editDraft: {},
         editMode: false,
         savingEdits: false,
+        canDeleteActions: __CAN_DELETE_ACTIONS__,
         uiNowMs: Date.now(),
         lastRefreshMs: null,
         loading: false
@@ -451,12 +456,16 @@ const html = `<!doctype html>
 
       function updateEditButtons() {
         tableEl?.classList.toggle("edit-mode", state.editMode);
-        editButton.style.display = state.editMode ? "none" : "";
+        editButton.style.display = state.canDeleteActions && !state.editMode ? "" : "none";
         saveButton.style.display = state.editMode ? "" : "none";
         cancelButton.style.display = state.editMode ? "" : "none";
         saveButton.disabled = state.savingEdits;
         cancelButton.disabled = state.savingEdits;
-        deleteAllButton.disabled = state.editMode;
+        tableEl?.querySelectorAll(".timer-delete-col").forEach((cell) => {
+          cell.style.display = state.canDeleteActions ? "" : "none";
+        });
+        deleteAllButton.style.display = state.canDeleteActions ? "" : "none";
+        deleteAllButton.disabled = state.editMode || !state.canDeleteActions;
       }
 
       function formatNow(ms) {
@@ -579,12 +588,12 @@ const html = `<!doctype html>
                 data-timestamp-ms="\${escapeHtml(String(row.timestampMs || 0))}"
               >\${escapeHtml(row.age)}</span>
             </td>
-            <td class="mobile-hide non-edit-col" data-label="Timer">
+            <td class="mobile-hide non-edit-col timer-delete-col" data-label="Timer">
               <button
                 class="timer-delete"
                 data-delete-single-timer-id="\${escapeHtml(row.id)}"
                 type="button"
-                \${state.editMode ? "disabled" : ""}
+                \${state.editMode || !state.canDeleteActions ? "disabled" : ""}
               >
                 Delete
               </button>
@@ -605,30 +614,32 @@ const html = `<!doctype html>
           });
         });
 
-        rowsEl.querySelectorAll(".timer-delete").forEach((button) => {
-          button.addEventListener("click", async (event) => {
-            const target = event.currentTarget;
-            const timerId = target.dataset.deleteSingleTimerId;
-            if (!timerId || state.editMode) return;
+        if (state.canDeleteActions) {
+          rowsEl.querySelectorAll(".timer-delete").forEach((button) => {
+            button.addEventListener("click", async (event) => {
+              const target = event.currentTarget;
+              const timerId = target.dataset.deleteSingleTimerId;
+              if (!timerId || state.editMode) return;
 
-            try {
-              const response = await fetch(\`/api/timer?id=\${encodeURIComponent(timerId)}\`, {
-                method: "DELETE"
-              });
+              try {
+                const response = await fetch(\`/api/timer?id=\${encodeURIComponent(timerId)}\`, {
+                  method: "DELETE"
+                });
 
-              if (!response.ok) throw new Error(\`HTTP \${response.status}\`);
-              state.rows = state.rows.filter((row, index) => {
-                const id = row.id ?? row.timerId ?? \`row-\${index + 1}\`;
-                return id !== timerId;
-              });
-              delete state.editDraft[timerId];
-              renderRows();
-              errorEl.textContent = "";
-            } catch (error) {
-              errorEl.textContent = String(error?.message || error);
-            }
+                if (!response.ok) throw new Error(\`HTTP \${response.status}\`);
+                state.rows = state.rows.filter((row, index) => {
+                  const id = row.id ?? row.timerId ?? \`row-\${index + 1}\`;
+                  return id !== timerId;
+                });
+                delete state.editDraft[timerId];
+                renderRows();
+                errorEl.textContent = "";
+              } catch (error) {
+                errorEl.textContent = String(error?.message || error);
+              }
+            });
           });
-        });
+        }
       }
       function updateAgeCells() {
         rowsEl.querySelectorAll("[data-age-timer-id]").forEach((node) => {
@@ -802,9 +813,31 @@ function jsonResponse(data: unknown, init?: ResponseInit) {
   });
 }
 
+function normalizeIp(value: string): string {
+  return value.startsWith("::ffff:") ? value.slice(7) : value;
+}
+
+function getClientIp(request: Request, server: Server): string {
+  const forwarded = request.headers.get("x-forwarded-for");
+  if (forwarded) return normalizeIp(forwarded.split(",")[0].trim());
+
+  const realIp = request.headers.get("x-real-ip");
+  if (realIp) return normalizeIp(realIp.trim());
+
+  const requestIp = server.requestIP(request);
+  if (requestIp?.address) return normalizeIp(requestIp.address);
+
+  return "";
+}
+
+function canDeleteForClientIp(clientIp: string): boolean {
+  if (UI_ALLOWED_IPS.length === 0) return true;
+  return UI_ALLOWED_IPS.some((ip) => normalizeIp(ip) === clientIp);
+}
+
 Bun.serve({
   port: PORT,
-  async fetch(request) {
+  async fetch(request, server) {
     const url = new URL(request.url);
 
     if (url.pathname === "/api/timers") {
@@ -896,10 +929,15 @@ Bun.serve({
     }
 
     if (url.pathname === "/") {
-      return new Response(html, {
+      const clientIp = getClientIp(request, server);
+      console.log(`[ui] client ip: ${clientIp || "unknown"}`);
+      const canDeleteActions = canDeleteForClientIp(clientIp);
+      const page = html.replace("__CAN_DELETE_ACTIONS__", canDeleteActions ? "true" : "false");
+      return new Response(page, {
         headers: {
           "content-type": "text/html; charset=utf-8"
-        }
+        },
+        status: 200
       });
     }
 
