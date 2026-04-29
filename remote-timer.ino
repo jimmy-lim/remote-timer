@@ -36,8 +36,8 @@ constexpr unsigned long LOADED_TIMER_TONE_START_DELAY_MS = 400UL;
 constexpr unsigned long LOADED_TIMER_TONE_SPACING_MS = 280UL;
 
 // Wi-Fi and config portal.
-constexpr unsigned long WIFI_CONNECT_TIMEOUT = 15000UL;
-constexpr unsigned long WIFI_RETRY_INTERVAL = 20000UL;
+constexpr unsigned long WIFI_CONNECT_TIMEOUT = 5000UL;
+constexpr unsigned long WIFI_RETRY_INTERVAL = 5000UL;
 
 constexpr size_t SSID_MAX_LEN = 32;
 constexpr size_t PASS_MAX_LEN = 64;
@@ -1078,6 +1078,7 @@ void setup() {
 
   loadConfig();
   startPortal();
+  WiFi.setSleep(false);
   if (actionQueue != nullptr) {
     xTaskCreate(
       timerActionTask,
