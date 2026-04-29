@@ -16,6 +16,25 @@ const UI_ALLOWED_IPS = (process.env.UI_ALLOWED_IPS || "")
   .split(",")
   .map((part) => part.trim())
   .filter(Boolean);
+const COMMIT_HASH = getCommitHash();
+
+function getCommitHash(): string {
+  const envHash = (process.env.GIT_COMMIT_HASH || "").trim();
+  if (envHash) return envHash;
+
+  try {
+    const result = Bun.spawnSync(["git", "rev-parse", "--short", "HEAD"], {
+      stdout: "pipe",
+      stderr: "ignore"
+    });
+    if (result.exitCode === 0) {
+      const hash = Buffer.from(result.stdout).toString("utf8").trim();
+      if (hash) return hash;
+    }
+  } catch {}
+
+  return "unknown";
+}
 
 const html = `<!doctype html>
 <html lang="en">
@@ -294,10 +313,14 @@ const html = `<!doctype html>
           <span class="label">Last API Refresh (10s)</span>
           <div class="value" id="last-refresh">never</div>
         </article>
+        <article class="card">
+          <span class="label">Commit</span>
+          <div class="value mono" id="commit-hash">${COMMIT_HASH}</div>
+        </article>
       </section>
 
       <div class="actions">
-        <span class="hint">Proxy target: <code>${TIMERS_URL}</code></span>
+        <span id="proxy-target-hint" class="hint">Proxy target: <code>${TIMERS_URL}</code></span>
         <button id="delete-all-button" class="danger" type="button">Delete All Timers</button>
         <button id="edit-button" type="button">Edit</button>
         <button id="save-button" type="button" style="display:none">Save</button>
@@ -351,6 +374,7 @@ const html = `<!doctype html>
       const saveButton = document.querySelector("#save-button");
       const cancelButton = document.querySelector("#cancel-button");
       const deleteAllButton = document.querySelector("#delete-all-button");
+      const proxyTargetHint = document.querySelector("#proxy-target-hint");
 
       function normalize(raw) {
         if (Array.isArray(raw)) {
@@ -464,6 +488,7 @@ const html = `<!doctype html>
         tableEl?.querySelectorAll(".timer-delete-col").forEach((cell) => {
           cell.style.display = state.canDeleteActions ? "" : "none";
         });
+        proxyTargetHint.style.display = state.canDeleteActions ? "" : "none";
         deleteAllButton.style.display = state.canDeleteActions ? "" : "none";
         deleteAllButton.disabled = state.editMode || !state.canDeleteActions;
       }
