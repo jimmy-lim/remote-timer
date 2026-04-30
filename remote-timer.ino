@@ -14,45 +14,59 @@
 constexpr uint8_t LED_PIN = 8;
 unsigned long lastLedToggle = 0;
 bool ledState = false;
+constexpr uint8_t RIGHT_BOARD_BUTTON_PIN = 9; // On-board right button (BOOT on most ESP32-C3 boards)
 
 // Buzzer output pin (adjust for your ESP32-C3 wiring).
 constexpr uint8_t BUZZER_PIN = 10;
 constexpr uint16_t SHORT_PRESS_TONES[4] = {523, 587, 659, 698}; // Do Re Mi Fa (C5 D5 E5 F5)
 constexpr uint16_t LONG_PRESS_TONES[4] = {784, 880, 988, 1047}; // So La Ti Do (G5 A5 B5 C6)
-constexpr unsigned long TONE_MS = 90;
-constexpr unsigned long TONE_GAP_MS = 70;
 
 // YK04 receiver outputs (adjust pins to match your board wiring).
 constexpr uint8_t BUTTON_PINS[4] = {0, 1, 3, 4};
 constexpr uint8_t BUTTON_COUNT = sizeof(BUTTON_PINS) / sizeof(BUTTON_PINS[0]);
-constexpr unsigned long DEBOUNCE_MS = 100;
-constexpr unsigned long LONG_PRESS_MS = 3000;
-constexpr unsigned long PRESS_COOLDOWN_MS = 1000;
-constexpr unsigned long DEVICE_STATE_POLL_MS = 60000UL;
-constexpr unsigned long ALERT_TONE_MS = 400UL;
-constexpr unsigned long ALERT_TONE_GAP_MS = 100UL;
-constexpr uint8_t ALERT_TONE_BEEPS = 2;
-constexpr unsigned long LOADED_TIMER_TONE_START_DELAY_MS = 400UL;
-constexpr unsigned long LOADED_TIMER_TONE_SPACING_MS = 280UL;
+namespace TimingCfg {
+constexpr unsigned long ToneMs = 90UL;
+constexpr unsigned long ToneGapMs = 70UL;
+constexpr unsigned long ButtonDebounceMs = 100UL;
+constexpr unsigned long ButtonLongPressMs = 3000UL;
+constexpr unsigned long ButtonPressCooldownMs = 1000UL;
+constexpr unsigned long DeviceStatePollMs = 60000UL;
+constexpr unsigned long AlertToneMs = 400UL;
+constexpr unsigned long AlertToneGapMs = 100UL;
+constexpr uint8_t AlertToneBeeps = 2;
+constexpr unsigned long LoadedTimerToneStartDelayMs = 400UL;
+constexpr unsigned long LoadedTimerToneSpacingMs = 280UL;
+constexpr unsigned long LedToggleMs = 1000UL;
+constexpr unsigned long LoopDelayMs = 5UL;
+constexpr unsigned long BoardButtonDebounceMs = 40UL;
+constexpr unsigned long BoardButtonCooldownMs = 500UL;
+}
 
-// Wi-Fi and config portal.
-constexpr unsigned long WIFI_CONNECT_TIMEOUT = 5000UL;
-constexpr unsigned long WIFI_RETRY_INTERVAL = 5000UL;
+namespace WiFiCfg {
+constexpr unsigned long DiagIntervalMs = 10000UL;
+constexpr unsigned long RecoveryBackoffMs = 3000UL;
+constexpr unsigned long ApAutoDisableDelayMs = 10000UL;
+}
 
-constexpr size_t SSID_MAX_LEN = 32;
-constexpr size_t PASS_MAX_LEN = 64;
-constexpr size_t HOST_MAX_LEN = 128;
-constexpr size_t TOKEN_MAX_LEN = 128;
-constexpr uint8_t ACTION_QUEUE_LEN = 4;
-constexpr uint8_t TONE_QUEUE_LEN = 16;
-constexpr unsigned long LED_TOGGLE_MS = 1000UL;
-constexpr unsigned long LOOP_DELAY_MS = 5UL;
+namespace NetCfg {
+constexpr unsigned long LockTimeoutMs = 1500UL;
+constexpr uint16_t HttpTimeoutMs = 1500U;
+}
+
+namespace LimitsCfg {
+constexpr size_t SsidMaxLen = 32;
+constexpr size_t PassMaxLen = 64;
+constexpr size_t HostMaxLen = 128;
+constexpr size_t TokenMaxLen = 128;
+constexpr uint8_t ActionQueueLen = 4;
+constexpr uint8_t ToneQueueLen = 16;
+}
 
 struct DeviceConfig {
-  char ssid[SSID_MAX_LEN + 1] = {};
-  char password[PASS_MAX_LEN + 1] = {};
-  char apiHost[HOST_MAX_LEN + 1] = "192.168.1.101:30109";
-  char bearerToken[TOKEN_MAX_LEN + 1] = {};
+  char ssid[LimitsCfg::SsidMaxLen + 1] = {};
+  char password[LimitsCfg::PassMaxLen + 1] = {};
+  char apiHost[LimitsCfg::HostMaxLen + 1] = "192.168.1.101:30109";
+  char bearerToken[LimitsCfg::TokenMaxLen + 1] = {};
 };
 
 struct ButtonState {
@@ -83,16 +97,11 @@ ButtonState buttons[BUTTON_COUNT];
 QueueHandle_t actionQueue = nullptr;
 QueueHandle_t toneQueue = nullptr;
 SemaphoreHandle_t statusMutex = nullptr;
-
-unsigned long lastReconnectAttempt = 0;
-bool wifiConnectInProgress = false;
-unsigned long wifiConnectStartedAt = 0;
+SemaphoreHandle_t networkMutex = nullptr;
 
 String statusLine = "Booting";
-unsigned long statusUpdatedAt = 0;
 
 String apSsid;
-String deviceId;
 String webhookBase;
 String deviceStateUrl;
 
@@ -119,8 +128,105 @@ unsigned long loadedTimerToneNextAt = 0;
 bool loadedTimerTonesPlayedThisBoot = false;
 bool rebootRequested = false;
 unsigned long rebootAt = 0;
-bool wifiReconnectRequested = false;
-unsigned long wifiReconnectAt = 0;
+wl_status_t lastWiFiStatus = WL_IDLE_STATUS;
+unsigned long lastWiFiDiagAt = 0;
+int lastWiFiRssi = 0;
+int lastWiFiChannel = 0;
+int lastWiFiDisconnectReason = 0;
+bool configApEnabled = false;
+bool apDisablePending = false;
+unsigned long apDisableAt = 0;
+bool configPortalStarted = false;
+bool boardBtnStablePressed = false;
+bool boardBtnLastRawPressed = false;
+unsigned long boardBtnRawChangedAt = 0;
+unsigned long boardBtnCooldownUntil = 0;
+bool wifiPasswordShownAtBoot = false;
+uint8_t wifiAuthExpireStreak = 0;
+bool wifiRecoveryPending = false;
+uint8_t wifiRecoveryStage = 0;
+unsigned long wifiRecoveryAt = 0;
+bool startupWaitForWiFi = true;
+
+void startPortal();
+void ensureConfigServerStarted();
+
+const char* wifiStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_NO_SHIELD: return "WL_NO_SHIELD";
+    case WL_IDLE_STATUS: return "WL_IDLE_STATUS";
+    case WL_NO_SSID_AVAIL: return "WL_NO_SSID_AVAIL";
+    case WL_SCAN_COMPLETED: return "WL_SCAN_COMPLETED";
+    case WL_CONNECTED: return "WL_CONNECTED";
+    case WL_CONNECT_FAILED: return "WL_CONNECT_FAILED";
+    case WL_CONNECTION_LOST: return "WL_CONNECTION_LOST";
+    case WL_DISCONNECTED: return "WL_DISCONNECTED";
+    default: return "WL_UNKNOWN";
+  }
+}
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      lastWiFiChannel = static_cast<int>(info.wifi_sta_connected.channel);
+      lastWiFiDisconnectReason = 0;
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      apDisablePending = false;
+      lastWiFiDisconnectReason = static_cast<int>(info.wifi_sta_disconnected.reason);
+      if (lastWiFiDisconnectReason == 2) {
+        if (wifiAuthExpireStreak < 255) {
+          wifiAuthExpireStreak++;
+        }
+        if (!wifiRecoveryPending && wifiAuthExpireStreak >= 8) {
+          wifiRecoveryPending = true;
+          wifiRecoveryStage = 1;
+          wifiRecoveryAt = millis() + 50UL;
+          setStatus("WiFi auth timeout, forcing clean reconnect");
+          break;
+        }
+      } else {
+        wifiAuthExpireStreak = 0;
+      }
+      {
+        char msg[72];
+        snprintf(
+          msg,
+          sizeof(msg),
+          "WiFi disconnected (auto reconnect, reason=%d)",
+          lastWiFiDisconnectReason
+        );
+        setStatus(msg);
+      }
+      // Avoid calling WiFi APIs from event context; sampled in loop diagnostics.
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP: {
+      if (configApEnabled) {
+        apDisablePending = true;
+        apDisableAt = millis() + WiFiCfg::ApAutoDisableDelayMs;
+      }
+      lastWiFiDisconnectReason = 0;
+      wifiAuthExpireStreak = 0;
+      startupWaitForWiFi = false;
+      setStatus("WiFi connected");
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+void updateWiFiDiagnostics(unsigned long now) {
+  const wl_status_t status = WiFi.status();
+  if (status != lastWiFiStatus) {
+    lastWiFiStatus = status;
+  }
+  if (status == WL_CONNECTED && (lastWiFiDiagAt == 0 || now - lastWiFiDiagAt >= WiFiCfg::DiagIntervalMs)) {
+    lastWiFiDiagAt = now;
+    lastWiFiRssi = WiFi.RSSI();
+    lastWiFiChannel = static_cast<int>(WiFi.channel());
+  }
+}
 
 static unsigned long effectiveElapsedMs(uint8_t idx, unsigned long now) {
   if (idx >= BUTTON_COUNT || !timerActiveByButton[idx]) {
@@ -167,10 +273,6 @@ static unsigned long nextBeepInMs(unsigned long elapsedMs, unsigned long alertAf
   return nextElapsedMs - elapsedMs;
 }
 
-static String secondsString(unsigned long ms) {
-  return String((ms + 500UL) / 1000UL);
-}
-
 static unsigned long roundedSeconds(unsigned long ms) {
   return (ms + 500UL) / 1000UL;
 }
@@ -181,12 +283,17 @@ static void appendUnsigned(String& out, unsigned long value) {
   out += buf;
 }
 
+static void appendSigned(String& out, long value) {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%ld", value);
+  out += buf;
+}
+
 static void setStatus(const String& s) {
   if (statusMutex != nullptr) {
     xSemaphoreTake(statusMutex, portMAX_DELAY);
   }
   statusLine = s;
-  statusUpdatedAt = millis();
   if (statusMutex != nullptr) {
     xSemaphoreGive(statusMutex);
   }
@@ -202,6 +309,38 @@ static String getStatusLine() {
     xSemaphoreGive(statusMutex);
   }
   return current;
+}
+
+static void logWiFiConnectAttempt(const char* phase, wl_status_t status) {
+  String line;
+  line.reserve(160);
+  line += F("WIFI ");
+  line += phase;
+  line += F(" status=");
+  line += wifiStatusName(status);
+  line += F(" ssid='");
+  line += cfg.ssid;
+  line += '\'';
+  Serial.println(line);
+}
+
+static String maskedPasswordTail3(const char* password) {
+  if (password == nullptr) {
+    return "";
+  }
+
+  const size_t len = strlen(password);
+  if (len <= 3) {
+    return String(password);
+  }
+
+  String masked;
+  masked.reserve(len);
+  for (size_t i = 0; i < len - 3; ++i) {
+    masked += '*';
+  }
+  masked += (password + len - 3);
+  return masked;
 }
 
 static void appendHtmlEscaped(String& out, const char* value) {
@@ -233,13 +372,6 @@ static void appendHtmlEscaped(String& out, const char* value) {
   }
 }
 
-static String htmlEscape(const String& value) {
-  String escaped;
-  escaped.reserve(value.length() + 16);
-  appendHtmlEscaped(escaped, value.c_str());
-  return escaped;
-}
-
 static uint64_t parseUint64(const char* s) {
   char* end = nullptr;
   unsigned long long n = strtoull(s, &end, 10);
@@ -247,10 +379,6 @@ static uint64_t parseUint64(const char* s) {
     return 0;
   }
   return static_cast<uint64_t>(n);
-}
-
-static uint64_t parseUint64(const String& value) {
-  return parseUint64(value.c_str());
 }
 
 static long parseLong(const char* s) {
@@ -365,37 +493,34 @@ void saveConfig() {
 void beginWiFiConnect() {
   if (!cfg.ssid[0]) {
     setStatus("No WiFi SSID configured");
-    wifiConnectInProgress = false;
     return;
   }
 
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.begin(cfg.ssid, cfg.password);
-  wifiConnectInProgress = true;
-  deviceStateLoaded = false;
-  lastDeviceStateFetchAttempt = 0;
-  wifiConnectStartedAt = millis();
-  lastReconnectAttempt = wifiConnectStartedAt;
-  setStatus("Connecting WiFi...");
-}
-
-void updateWiFiConnection(unsigned long now) {
-  if (!wifiConnectInProgress) {
-    return;
-  }
-
-  wl_status_t status = WiFi.status();
+  const wl_status_t status = WiFi.status();
+  logWiFiConnectAttempt("attempt", status);
   if (status == WL_CONNECTED) {
-    wifiConnectInProgress = false;
     setStatus("WiFi connected");
     return;
   }
 
-  if (now - wifiConnectStartedAt >= WIFI_CONNECT_TIMEOUT) {
-    wifiConnectInProgress = false;
-    WiFi.disconnect();
-    setStatus("WiFi connect failed");
+  const wl_status_t beginStatus = WiFi.begin(cfg.ssid, cfg.password);
+  if (beginStatus == WL_CONNECT_FAILED) {
+    logWiFiConnectAttempt("request_failed", WiFi.status());
+    setStatus("WiFi connect request failed");
+    return;
   }
+
+  deviceStateLoaded = false;
+  lastDeviceStateFetchAttempt = 0;
+  String connectMsg = "Connecting WiFi...";
+  connectMsg += " ssid=";
+  connectMsg += cfg.ssid;
+  if (!wifiPasswordShownAtBoot) {
+    connectMsg += " pass=";
+    connectMsg += maskedPasswordTail3(cfg.password);
+    wifiPasswordShownAtBoot = true;
+  }
+  setStatus(connectMsg);
 }
 
 void handleRoot() {
@@ -459,12 +584,13 @@ void handleSave() {
 
   saveConfig();
   configServer.send(200, "text/html", F("<h2>Saved</h2><p>WiFi reconnect started. Check status on the main page.</p><a href='/'>Back</a>"));
-  wifiReconnectRequested = true;
-  wifiReconnectAt = millis() + 800UL;
+  WiFi.disconnect(false, false);
+  beginWiFiConnect();
 }
 
 void handleDebug() {
   const unsigned long now = millis();
+  const wl_status_t wifiStatus = WiFi.status();
   const unsigned long freeHeap = ESP.getFreeHeap();
   const unsigned long minFreeHeap = ESP.getMinFreeHeap();
   const unsigned long maxAllocHeap = ESP.getMaxAllocHeap();
@@ -487,6 +613,14 @@ void handleDebug() {
   appendUnsigned(out, maxAllocHeap);
   out += F(" fragPct=");
   appendUnsigned(out, fragPct);
+  out += F(" wifiStatus=");
+  out += wifiStatusName(wifiStatus);
+  out += F(" wifiRssi=");
+  appendSigned(out, lastWiFiRssi);
+  out += F(" wifiCh=");
+  appendSigned(out, lastWiFiChannel);
+  out += F(" wifiDiscReason=");
+  appendSigned(out, lastWiFiDisconnectReason);
   out += '\n';
 
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
@@ -519,22 +653,49 @@ void handleReboot() {
   configServer.send(200, "text/plain", "rebooting\n");
 }
 
+void ensureConfigServerStarted() {
+  if (!configPortalStarted) {
+    apSsid = String("RemoteTimer-") + suffix;
+    configServer.on("/", HTTP_GET, handleRoot);
+    configServer.on("/debug", HTTP_GET, handleDebug);
+    configServer.on("/save", HTTP_POST, handleSave);
+    configServer.on("/reboot", HTTP_POST, handleReboot);
+    configServer.on("/reboot", HTTP_GET, handleReboot);
+    configServer.onNotFound(handleRoot);
+    configServer.begin();
+    configPortalStarted = true;
+  }
+}
+
 void startPortal() {
-  
-  apSsid = String("RemoteTimer-") + suffix;
+  ensureConfigServerStarted();
+  if (configApEnabled) {
+    return;
+  }
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(apSsid.c_str());
-
-  configServer.on("/", HTTP_GET, handleRoot);
-  configServer.on("/debug", HTTP_GET, handleDebug);
-  configServer.on("/save", HTTP_POST, handleSave);
-  configServer.on("/reboot", HTTP_POST, handleReboot);
-  configServer.on("/reboot", HTTP_GET, handleReboot);
-  configServer.onNotFound(handleRoot);
-  configServer.begin();
-
+  configApEnabled = true;
   setStatus("Config AP: " + apSsid);
+}
+
+void updateConfigApAutoDisable(unsigned long now) {
+  if (!configApEnabled || !apDisablePending) {
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  if ((long)(now - apDisableAt) < 0) {
+    return;
+  }
+
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  configApEnabled = false;
+  apDisablePending = false;
+  setStatus("Config AP disabled");
+  Serial.println("WIFI AP disabled after stable STA connection");
 }
 
 bool performTimerAction(uint8_t buttonIndex, const char* action) {
@@ -556,8 +717,16 @@ bool performTimerAction(uint8_t buttonIndex, const char* action) {
   const char* separator = strchr(base, '?') ? "&id=" : "?id=";
   snprintf(url, sizeof(url), "%s%s%s", base, separator, idValue);
 
+  if (networkMutex != nullptr) {
+    if (xSemaphoreTake(networkMutex, pdMS_TO_TICKS(NetCfg::LockTimeoutMs)) != pdTRUE) {
+      setStatus("API busy");
+      return false;
+    }
+  }
+
   HTTPClient http;
   WiFiClient client;
+  http.setTimeout(NetCfg::HttpTimeoutMs);
   http.begin(client, url);
   if (cfg.bearerToken[0]) {
     http.addHeader("Authorization", String("Bearer ") + cfg.bearerToken);
@@ -572,15 +741,28 @@ bool performTimerAction(uint8_t buttonIndex, const char* action) {
 
   if (code >= 200 && code < 300) {
     http.end();
+    if (networkMutex != nullptr) {
+      xSemaphoreGive(networkMutex);
+    }
     char msg[64];
     snprintf(msg, sizeof(msg), "%s btn %u OK (%d)", action, static_cast<unsigned>(buttonIndex + 1), code);
     setStatus(msg);
     return true;
   }
 
-  String resp = code > 0 ? http.getString() : http.errorToString(code);
   http.end();
-  String fail = String(action) + " btn " + String(buttonIndex + 1) + " fail (" + String(code) + ") " + resp;
+  if (networkMutex != nullptr) {
+    xSemaphoreGive(networkMutex);
+  }
+  char fail[80];
+  snprintf(
+    fail,
+    sizeof(fail),
+    "%s btn %u fail (%d)",
+    action,
+    static_cast<unsigned>(buttonIndex + 1),
+    code
+  );
   setStatus(fail);
   return false;
 }
@@ -615,8 +797,8 @@ bool enqueueTonePattern(uint8_t buttonIndex, bool isLongPress, uint8_t beepCount
   TonePattern pattern;
   pattern.frequency = isLongPress ? LONG_PRESS_TONES[buttonIndex] : SHORT_PRESS_TONES[buttonIndex];
   pattern.beepsRemaining = beepCount;
-  pattern.toneMs = TONE_MS;
-  pattern.gapMs = TONE_GAP_MS;
+  pattern.toneMs = TimingCfg::ToneMs;
+  pattern.gapMs = TimingCfg::ToneGapMs;
 
   const bool ok = xQueueSend(toneQueue, &pattern, 0) == pdTRUE;
   if (ok) {
@@ -643,9 +825,9 @@ bool enqueueAlertTonePattern(uint8_t buttonIndex) {
 
   TonePattern pattern;
   pattern.frequency = SHORT_PRESS_TONES[buttonIndex];
-  pattern.beepsRemaining = ALERT_TONE_BEEPS;
-  pattern.toneMs = ALERT_TONE_MS;
-  pattern.gapMs = ALERT_TONE_GAP_MS;
+  pattern.beepsRemaining = TimingCfg::AlertToneBeeps;
+  pattern.toneMs = TimingCfg::AlertToneMs;
+  pattern.gapMs = TimingCfg::AlertToneGapMs;
 
   const bool ok = xQueueSend(toneQueue, &pattern, 0) == pdTRUE;
   if (ok) {
@@ -678,8 +860,8 @@ void enqueueStartupToneSeries() {
     TonePattern pattern;
     pattern.frequency = SHORT_PRESS_TONES[i];
     pattern.beepsRemaining = 1;
-    pattern.toneMs = TONE_MS;
-    pattern.gapMs = TONE_GAP_MS;
+    pattern.toneMs = TimingCfg::ToneMs;
+    pattern.gapMs = TimingCfg::ToneGapMs;
     xQueueSend(toneQueue, &pattern, 0);
   }
 
@@ -687,10 +869,41 @@ void enqueueStartupToneSeries() {
     TonePattern pattern;
     pattern.frequency = LONG_PRESS_TONES[i];
     pattern.beepsRemaining = 1;
-    pattern.toneMs = TONE_MS;
-    pattern.gapMs = TONE_GAP_MS;
+    pattern.toneMs = TimingCfg::ToneMs;
+    pattern.gapMs = TimingCfg::ToneGapMs;
     xQueueSend(toneQueue, &pattern, 0);
   }
+}
+
+void enqueueStartupToneSeriesReversed() {
+  if (toneQueue == nullptr) {
+    return;
+  }
+
+  // Reverse of startup: long tones 4->1, then short tones 4->1.
+  for (int i = static_cast<int>(BUTTON_COUNT) - 1; i >= 0; i--) {
+    TonePattern pattern;
+    pattern.frequency = LONG_PRESS_TONES[static_cast<uint8_t>(i)];
+    pattern.beepsRemaining = 1;
+    pattern.toneMs = TimingCfg::ToneMs;
+    pattern.gapMs = TimingCfg::ToneGapMs;
+    xQueueSend(toneQueue, &pattern, 0);
+  }
+
+  for (int i = static_cast<int>(BUTTON_COUNT) - 1; i >= 0; i--) {
+    TonePattern pattern;
+    pattern.frequency = SHORT_PRESS_TONES[static_cast<uint8_t>(i)];
+    pattern.beepsRemaining = 1;
+    pattern.toneMs = TimingCfg::ToneMs;
+    pattern.gapMs = TimingCfg::ToneGapMs;
+    xQueueSend(toneQueue, &pattern, 0);
+  }
+}
+
+void runSelfTestMelody() {
+  Serial.println("Self-test requested: startup tones in reverse");
+  enqueueStartupToneSeriesReversed();
+  setStatus("Self-test queued");
 }
 
 void queueLoadedTimerTones() {
@@ -720,7 +933,7 @@ void flushLoadedTimerToneQueue(unsigned long now) {
       return;
     }
     loadedTimerToneStarted = true;
-    loadedTimerToneNextAt = now + LOADED_TIMER_TONE_START_DELAY_MS;
+    loadedTimerToneNextAt = now + TimingCfg::LoadedTimerToneStartDelayMs;
     return;
   }
 
@@ -735,7 +948,7 @@ void flushLoadedTimerToneQueue(unsigned long now) {
     }
     if (enqueueTonePattern(i, false, 1)) {
       loadedTimerTonePendingMask = static_cast<uint8_t>(loadedTimerTonePendingMask & ~bit);
-      loadedTimerToneNextAt = now + LOADED_TIMER_TONE_SPACING_MS;
+      loadedTimerToneNextAt = now + TimingCfg::LoadedTimerToneSpacingMs;
       break;
     }
   }
@@ -762,16 +975,20 @@ void applyTimerActionToAlertState(uint8_t buttonIndex, bool isDelete) {
   lastAlertIndex[buttonIndex] = -1;
 }
 
-void timerActionTask(void* parameter) {
-  TimerAction action;
+void processTimerActions() {
+  if (actionQueue == nullptr) {
+    return;
+  }
 
-  for (;;) {
-    if (xQueueReceive(actionQueue, &action, portMAX_DELAY) == pdTRUE) {
-      if (performTimerAction(action.buttonIndex, action.isDelete ? "delete" : "set")) {
-        applyTimerActionToAlertState(action.buttonIndex, action.isDelete);
-        enqueueTonePattern(action.buttonIndex, action.isDelete, 1);
-      }
+  TimerAction action;
+  // Drain a small bounded batch each loop to keep UI/button handling responsive.
+  uint8_t processed = 0;
+  while (processed < LimitsCfg::ActionQueueLen && xQueueReceive(actionQueue, &action, 0) == pdTRUE) {
+    if (performTimerAction(action.buttonIndex, action.isDelete ? "delete" : "set")) {
+      applyTimerActionToAlertState(action.buttonIndex, action.isDelete);
+      enqueueTonePattern(action.buttonIndex, action.isDelete, 1);
     }
+    processed++;
   }
 }
 
@@ -833,6 +1050,34 @@ void handleButtonAction(uint8_t i, bool isLongPress) {
   }
 }
 
+void updateBoardButton(unsigned long now) {
+  // On-board button is active LOW with pull-up.
+  const bool rawPressed = digitalRead(RIGHT_BOARD_BUTTON_PIN) == LOW;
+
+  if (rawPressed != boardBtnLastRawPressed) {
+    boardBtnLastRawPressed = rawPressed;
+    boardBtnRawChangedAt = now;
+  }
+
+  if ((now - boardBtnRawChangedAt) < TimingCfg::BoardButtonDebounceMs) {
+    return;
+  }
+
+  if ((long)(now - boardBtnCooldownUntil) < 0) {
+    boardBtnStablePressed = rawPressed;
+    return;
+  }
+
+  if (rawPressed != boardBtnStablePressed) {
+    boardBtnStablePressed = rawPressed;
+    // Trigger on release after a valid press.
+    if (!boardBtnStablePressed) {
+      runSelfTestMelody();
+      boardBtnCooldownUntil = now + TimingCfg::BoardButtonCooldownMs;
+    }
+  }
+}
+
 void updateButtons() {
   unsigned long now = millis();
 
@@ -847,7 +1092,7 @@ void updateButtons() {
       b.rawChangedAt = now;
     }
 
-    if ((now - b.rawChangedAt) < DEBOUNCE_MS) {
+    if ((now - b.rawChangedAt) < TimingCfg::ButtonDebounceMs) {
       continue;
     }
 
@@ -867,15 +1112,15 @@ void updateButtons() {
       } else {
         if (!b.longTriggered) {
           handleButtonAction(i, false);
-          b.cooldownUntil = now + PRESS_COOLDOWN_MS;
+          b.cooldownUntil = now + TimingCfg::ButtonPressCooldownMs;
         }
       }
     }
 
-    if (b.stablePressed && !b.longTriggered && (now - b.pressedAt >= LONG_PRESS_MS)) {
+    if (b.stablePressed && !b.longTriggered && (now - b.pressedAt >= TimingCfg::ButtonLongPressMs)) {
       b.longTriggered = true;
       handleButtonAction(i, true);
-      b.cooldownUntil = now + PRESS_COOLDOWN_MS;
+      b.cooldownUntil = now + TimingCfg::ButtonPressCooldownMs;
     }
   }
 }
@@ -884,13 +1129,20 @@ void pollDeviceState(unsigned long now) {
   if (WiFi.status() != WL_CONNECTED || !deviceStateUrl.length()) {
     return;
   }
-  if (lastDeviceStateFetchAttempt != 0 && (now - lastDeviceStateFetchAttempt < DEVICE_STATE_POLL_MS)) {
+  if (lastDeviceStateFetchAttempt != 0 && (now - lastDeviceStateFetchAttempt < TimingCfg::DeviceStatePollMs)) {
     return;
   }
   lastDeviceStateFetchAttempt = now;
 
+  if (networkMutex != nullptr) {
+    if (xSemaphoreTake(networkMutex, pdMS_TO_TICKS(NetCfg::LockTimeoutMs)) != pdTRUE) {
+      return;
+    }
+  }
+
   HTTPClient http;
   WiFiClient client;
+  http.setTimeout(NetCfg::HttpTimeoutMs);
   http.begin(client, deviceStateUrl);
   if (cfg.bearerToken[0]) {
     http.addHeader("Authorization", String("Bearer ") + cfg.bearerToken);
@@ -899,6 +1151,9 @@ void pollDeviceState(unsigned long now) {
   const int code = http.GET();
   if (code != 200) {
     http.end();
+    if (networkMutex != nullptr) {
+      xSemaphoreGive(networkMutex);
+    }
     return;
   }
 
@@ -1000,6 +1255,9 @@ void pollDeviceState(unsigned long now) {
     seenButton[idx] = true;
   }
   http.end();
+  if (networkMutex != nullptr) {
+    xSemaphoreGive(networkMutex);
+  }
 
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
     if (!seenButton[i]) {
@@ -1055,18 +1313,17 @@ void setup() {
   Serial.begin(115200);
   Serial.println("=== ESP32-C3 Remote Timer Boot ===");
   statusMutex = xSemaphoreCreateMutex();
-  actionQueue = xQueueCreate(ACTION_QUEUE_LEN, sizeof(TimerAction));
-  toneQueue = xQueueCreate(TONE_QUEUE_LEN, sizeof(TonePattern));
+  networkMutex = xSemaphoreCreateMutex();
+  actionQueue = xQueueCreate(LimitsCfg::ActionQueueLen, sizeof(TimerAction));
+  toneQueue = xQueueCreate(LimitsCfg::ToneQueueLen, sizeof(TonePattern));
   uint64_t mac = ESP.getEfuseMac();
   char suffixBuf[7];
   snprintf(suffixBuf, sizeof(suffixBuf), "%06llX", mac & 0xFFFFFFULL);
   suffix = String(suffixBuf);
-  char deviceBuf[13];
-  snprintf(deviceBuf, sizeof(deviceBuf), "%012llX", mac & 0xFFFFFFFFFFFFULL);
-  deviceId = String(deviceBuf);
 
   ledcAttach(BUZZER_PIN, 2000, 8);
   ledcWriteTone(BUZZER_PIN, 0);
+  pinMode(RIGHT_BOARD_BUTTON_PIN, INPUT_PULLUP);
 
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
     pinMode(BUTTON_PINS[i], INPUT);
@@ -1075,18 +1332,15 @@ void setup() {
   enqueueStartupToneSeries();
 
   loadConfig();
-  startPortal();
-  WiFi.setSleep(false);
-  if (actionQueue != nullptr) {
-    xTaskCreate(
-      timerActionTask,
-      "timer-action",
-      8192,
-      nullptr,
-      1,
-      nullptr
-    );
-  } else {
+  WiFi.mode(WIFI_STA);
+  ensureConfigServerStarted();
+  WiFi.onEvent(onWiFiEvent);
+  WiFi.setAutoReconnect(true);
+  if (!cfg.ssid[0]) {
+    startupWaitForWiFi = false;
+    startPortal();
+  }
+  if (actionQueue == nullptr) {
     setStatus("API queue init failed");
   }
 
@@ -1097,25 +1351,40 @@ void loop() {
   unsigned long now = millis();
 
   configServer.handleClient();
-  if (wifiReconnectRequested && (long)(now - wifiReconnectAt) >= 0) {
-    wifiReconnectRequested = false;
-    beginWiFiConnect();
+  if (wifiRecoveryPending && (long)(now - wifiRecoveryAt) >= 0) {
+    if (wifiRecoveryStage == 1) {
+      WiFi.setAutoReconnect(false);
+      WiFi.disconnect(true, true);
+      wifiRecoveryStage = 2;
+      wifiRecoveryAt = now + WiFiCfg::RecoveryBackoffMs;
+      setStatus("WiFi recovery backoff before reconnect");
+    } else {
+      WiFi.mode(WIFI_STA);
+      WiFi.setAutoReconnect(true);
+      beginWiFiConnect();
+      wifiRecoveryPending = false;
+      wifiRecoveryStage = 0;
+      wifiAuthExpireStreak = 0;
+    }
+  }
+  if (startupWaitForWiFi && WiFi.status() != WL_CONNECTED) {
+    updateWiFiDiagnostics(now);
+    updateConfigApAutoDisable(now);
+    delay(TimingCfg::LoopDelayMs);
+    return;
   }
   updateButtons();
+  updateBoardButton(now);
+  processTimerActions();
   pollDeviceState(now);
   now = millis();
   updateLocalAlerts(now);
   flushLoadedTimerToneQueue(now);
   updateTone(now);
-  updateWiFiConnection(now);
+  updateWiFiDiagnostics(now);
+  updateConfigApAutoDisable(now);
 
-  if (WiFi.status() != WL_CONNECTED && !wifiConnectInProgress) {
-    if (now - lastReconnectAttempt >= WIFI_RETRY_INTERVAL) {
-      beginWiFiConnect();
-    }
-  }
-
-  if (now - lastLedToggle >= LED_TOGGLE_MS) {
+  if (now - lastLedToggle >= TimingCfg::LedToggleMs) {
     lastLedToggle = now;
     ledState = !ledState;
     digitalWrite(LED_PIN, ledState);
@@ -1125,5 +1394,5 @@ void loop() {
     ESP.restart();
   }
 
-  delay(LOOP_DELAY_MS);
+  delay(TimingCfg::LoopDelayMs);
 }
