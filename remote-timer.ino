@@ -213,7 +213,13 @@ static unsigned long nextBeepInMs(unsigned long elapsedMs, unsigned long alertAf
 }
 
 static unsigned long roundedSeconds(unsigned long ms) {
-  return (ms + 500UL) / 1000UL;
+  const unsigned long whole = ms / 1000UL;
+  const unsigned long remainder = ms % 1000UL;
+  return whole + (remainder >= 500UL ? 1UL : 0UL);
+}
+
+static unsigned long clampToUlongMs(uint64_t valueMs) {
+  return valueMs > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : static_cast<unsigned long>(valueMs);
 }
 
 static void appendUnsigned(String& out, unsigned long value) {
@@ -528,6 +534,7 @@ void handleSave() {
 }
 
 void handleDebug() {
+  const unsigned long startedAtMs = millis();
   const unsigned long now = millis();
   const wl_status_t wifiStatus = WiFi.status();
   const unsigned long freeHeap = ESP.getFreeHeap();
@@ -581,6 +588,10 @@ void handleDebug() {
   }
 
   configServer.send(200, "text/plain", out);
+  const unsigned long servedInMs = millis() - startedAtMs;
+  Serial.print("DEBUG /debug served in ");
+  Serial.print(servedInMs);
+  Serial.println(" ms");
 }
 
 void handleReboot() {
@@ -776,11 +787,11 @@ bool enqueueAlertTonePattern(uint8_t buttonIndex) {
     Serial.print(" freq=");
     Serial.print(static_cast<unsigned>(pattern.frequency));
     Serial.print(" elapsed=");
-    Serial.print(effectiveElapsedMs(buttonIndex, millis()));
+    Serial.print(roundedSeconds(effectiveElapsedMs(buttonIndex, millis())));
     Serial.print(" after=");
-    Serial.print(alertAfterMsByButton[buttonIndex]);
+    Serial.print(roundedSeconds(alertAfterMsByButton[buttonIndex]));
     Serial.print(" interval=");
-    Serial.println(alertIntervalMsByButton[buttonIndex]);
+    Serial.println(roundedSeconds(alertIntervalMsByButton[buttonIndex]));
   } else {
     Serial.print("ENQ tone alert FAILED b");
     Serial.println(static_cast<unsigned>(buttonIndex + 1));
@@ -1096,6 +1107,10 @@ void pollDeviceState(unsigned long now) {
   const bool suppressInitialDueBeeps = !deviceStateLoaded;
   uint64_t nowEpochMs = 0;
   bool seenButton[BUTTON_COUNT] = {false, false, false, false};
+  bool parsedMutedByButton[BUTTON_COUNT] = {false, false, false, false};
+  uint64_t parsedTimestampMsByButton[BUTTON_COUNT] = {0, 0, 0, 0};
+  unsigned long parsedAlertAfterMsByButton[BUTTON_COUNT] = {0, 0, 0, 0};
+  unsigned long parsedAlertIntervalMsByButton[BUTTON_COUNT] = {0, 0, 0, 0};
   WiFiClient* stream = http.getStreamPtr();
   char line[160];
   while (stream != nullptr && (stream->connected() || stream->available())) {
@@ -1143,51 +1158,10 @@ void pollDeviceState(unsigned long now) {
     const uint8_t idx = static_cast<uint8_t>(button - 1);
     const uint64_t timestampMs = parseUint64(c1 + 1);
     const int mutedInt = static_cast<int>(parseLong(c2 + 1));
-    const unsigned long alertAfterMs = static_cast<unsigned long>(parseUint64(c3 + 1));
-    const unsigned long alertIntervalMs = static_cast<unsigned long>(parseUint64(c4 + 1));
-
-    alertMutedByButton[idx] = mutedInt != 0;
-    alertAfterMsByButton[idx] = alertAfterMs;
-    alertIntervalMsByButton[idx] = alertIntervalMs;
-
-    if (alertMutedByButton[idx]) {
-      // Fully drop muted timers from local processing.
-      timerActiveByButton[idx] = false;
-      timerElapsedBaseMsByButton[idx] = 0;
-      timerElapsedBaseAtMsByButton[idx] = 0;
-      timerEpochMsByButton[idx] = 0;
-      lastAlertIndex[idx] = -1;
-      seenButton[idx] = true;
-      continue;
-    }
-
-    if (timestampMs > 0 && nowEpochMs > 0 && nowEpochMs >= timestampMs) {
-      const bool timerChanged = timerEpochMsByButton[idx] != timestampMs;
-      timerEpochMsByButton[idx] = timestampMs;
-      const uint64_t elapsedMs64 = nowEpochMs - timestampMs;
-      const unsigned long nowMs = millis();
-      timerActiveByButton[idx] = true;
-      timerElapsedBaseMsByButton[idx] = elapsedMs64;
-      timerElapsedBaseAtMsByButton[idx] = nowMs;
-
-      if (suppressInitialDueBeeps) {
-        const unsigned long elapsedMs =
-          elapsedMs64 > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : static_cast<unsigned long>(elapsedMs64);
-        // On first load, seed alert index from current elapsed to avoid immediate overdue beeps.
-        lastAlertIndex[idx] = alertIndexForElapsed(elapsedMs, alertAfterMs, alertIntervalMs);
-      } else if (timerChanged) {
-        // On a newly observed timer timestamp, reset alert index so the next
-        // local tick can trigger the first due alert beep at/after alertAfter.
-        lastAlertIndex[idx] = -1;
-      }
-    } else {
-      timerActiveByButton[idx] = false;
-      timerElapsedBaseMsByButton[idx] = 0;
-      timerElapsedBaseAtMsByButton[idx] = 0;
-      timerEpochMsByButton[idx] = 0;
-      lastAlertIndex[idx] = -1;
-    }
-
+    parsedMutedByButton[idx] = mutedInt != 0;
+    parsedTimestampMsByButton[idx] = timestampMs;
+    parsedAlertAfterMsByButton[idx] = clampToUlongMs(parseUint64(c3 + 1));
+    parsedAlertIntervalMsByButton[idx] = clampToUlongMs(parseUint64(c4 + 1));
     seenButton[idx] = true;
   }
   http.end();
@@ -1200,6 +1174,48 @@ void pollDeviceState(unsigned long now) {
       alertMutedByButton[i] = false;
       alertAfterMsByButton[i] = 0;
       alertIntervalMsByButton[i] = 0;
+      timerActiveByButton[i] = false;
+      timerElapsedBaseMsByButton[i] = 0;
+      timerElapsedBaseAtMsByButton[i] = 0;
+      timerEpochMsByButton[i] = 0;
+      lastAlertIndex[i] = -1;
+      continue;
+    }
+
+    alertMutedByButton[i] = parsedMutedByButton[i];
+    alertAfterMsByButton[i] = parsedAlertAfterMsByButton[i];
+    alertIntervalMsByButton[i] = parsedAlertIntervalMsByButton[i];
+
+    if (alertMutedByButton[i]) {
+      // Fully drop muted timers from local processing.
+      timerActiveByButton[i] = false;
+      timerElapsedBaseMsByButton[i] = 0;
+      timerElapsedBaseAtMsByButton[i] = 0;
+      timerEpochMsByButton[i] = 0;
+      lastAlertIndex[i] = -1;
+      continue;
+    }
+
+    const uint64_t timestampMs = parsedTimestampMsByButton[i];
+    if (timestampMs > 0 && nowEpochMs > 0 && nowEpochMs >= timestampMs) {
+      const bool timerChanged = timerEpochMsByButton[i] != timestampMs;
+      timerEpochMsByButton[i] = timestampMs;
+      const uint64_t elapsedMs64 = nowEpochMs - timestampMs;
+      const unsigned long nowMs = millis();
+      timerActiveByButton[i] = true;
+      timerElapsedBaseMsByButton[i] = elapsedMs64;
+      timerElapsedBaseAtMsByButton[i] = nowMs;
+
+      if (suppressInitialDueBeeps) {
+        const unsigned long elapsedMs = clampToUlongMs(elapsedMs64);
+        // On first load, seed alert index from current elapsed to avoid immediate overdue beeps.
+        lastAlertIndex[i] = alertIndexForElapsed(elapsedMs, alertAfterMsByButton[i], alertIntervalMsByButton[i]);
+      } else if (timerChanged) {
+        // On a newly observed timer timestamp, reset alert index so the next
+        // local tick can trigger the first due alert beep at/after alertAfter.
+        lastAlertIndex[i] = -1;
+      }
+    } else {
       timerActiveByButton[i] = false;
       timerElapsedBaseMsByButton[i] = 0;
       timerElapsedBaseAtMsByButton[i] = 0;
