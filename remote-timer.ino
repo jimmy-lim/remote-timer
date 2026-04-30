@@ -44,7 +44,6 @@ constexpr unsigned long BoardButtonCooldownMs = 500UL;
 
 namespace WiFiCfg {
 constexpr unsigned long DiagIntervalMs = 10000UL;
-constexpr unsigned long RecoveryBackoffMs = 3000UL;
 constexpr unsigned long ApAutoDisableDelayMs = 10000UL;
 }
 
@@ -128,11 +127,9 @@ unsigned long loadedTimerToneNextAt = 0;
 bool loadedTimerTonesPlayedThisBoot = false;
 bool rebootRequested = false;
 unsigned long rebootAt = 0;
-wl_status_t lastWiFiStatus = WL_IDLE_STATUS;
 unsigned long lastWiFiDiagAt = 0;
 int lastWiFiRssi = 0;
 int lastWiFiChannel = 0;
-int lastWiFiDisconnectReason = 0;
 bool configApEnabled = false;
 bool apDisablePending = false;
 unsigned long apDisableAt = 0;
@@ -142,10 +139,6 @@ bool boardBtnLastRawPressed = false;
 unsigned long boardBtnRawChangedAt = 0;
 unsigned long boardBtnCooldownUntil = 0;
 bool wifiPasswordShownAtBoot = false;
-uint8_t wifiAuthExpireStreak = 0;
-bool wifiRecoveryPending = false;
-uint8_t wifiRecoveryStage = 0;
-unsigned long wifiRecoveryAt = 0;
 bool startupWaitForWiFi = true;
 
 void startPortal();
@@ -165,62 +158,8 @@ const char* wifiStatusName(wl_status_t status) {
   }
 }
 
-void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
-  switch (event) {
-    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      lastWiFiChannel = static_cast<int>(info.wifi_sta_connected.channel);
-      lastWiFiDisconnectReason = 0;
-      break;
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-      apDisablePending = false;
-      lastWiFiDisconnectReason = static_cast<int>(info.wifi_sta_disconnected.reason);
-      if (lastWiFiDisconnectReason == 2) {
-        if (wifiAuthExpireStreak < 255) {
-          wifiAuthExpireStreak++;
-        }
-        if (!wifiRecoveryPending && wifiAuthExpireStreak >= 8) {
-          wifiRecoveryPending = true;
-          wifiRecoveryStage = 1;
-          wifiRecoveryAt = millis() + 50UL;
-          setStatus("WiFi auth timeout, forcing clean reconnect");
-          break;
-        }
-      } else {
-        wifiAuthExpireStreak = 0;
-      }
-      {
-        char msg[72];
-        snprintf(
-          msg,
-          sizeof(msg),
-          "WiFi disconnected (auto reconnect, reason=%d)",
-          lastWiFiDisconnectReason
-        );
-        setStatus(msg);
-      }
-      // Avoid calling WiFi APIs from event context; sampled in loop diagnostics.
-      break;
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP: {
-      if (configApEnabled) {
-        apDisablePending = true;
-        apDisableAt = millis() + WiFiCfg::ApAutoDisableDelayMs;
-      }
-      lastWiFiDisconnectReason = 0;
-      wifiAuthExpireStreak = 0;
-      startupWaitForWiFi = false;
-      setStatus("WiFi connected");
-      break;
-    }
-    default:
-      break;
-  }
-}
-
 void updateWiFiDiagnostics(unsigned long now) {
   const wl_status_t status = WiFi.status();
-  if (status != lastWiFiStatus) {
-    lastWiFiStatus = status;
-  }
   if (status == WL_CONNECTED && (lastWiFiDiagAt == 0 || now - lastWiFiDiagAt >= WiFiCfg::DiagIntervalMs)) {
     lastWiFiDiagAt = now;
     lastWiFiRssi = WiFi.RSSI();
@@ -619,8 +558,6 @@ void handleDebug() {
   appendSigned(out, lastWiFiRssi);
   out += F(" wifiCh=");
   appendSigned(out, lastWiFiChannel);
-  out += F(" wifiDiscReason=");
-  appendSigned(out, lastWiFiDisconnectReason);
   out += '\n';
 
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
@@ -901,9 +838,8 @@ void enqueueStartupToneSeriesReversed() {
 }
 
 void runSelfTestMelody() {
-  Serial.println("Self-test requested: startup tones in reverse");
+  Serial.println("Self-test: reversed startup tones");
   enqueueStartupToneSeriesReversed();
-  setStatus("Self-test queued");
 }
 
 void queueLoadedTimerTones() {
@@ -1334,7 +1270,6 @@ void setup() {
   loadConfig();
   WiFi.mode(WIFI_STA);
   ensureConfigServerStarted();
-  WiFi.onEvent(onWiFiEvent);
   WiFi.setAutoReconnect(true);
   if (!cfg.ssid[0]) {
     startupWaitForWiFi = false;
@@ -1351,21 +1286,13 @@ void loop() {
   unsigned long now = millis();
 
   configServer.handleClient();
-  if (wifiRecoveryPending && (long)(now - wifiRecoveryAt) >= 0) {
-    if (wifiRecoveryStage == 1) {
-      WiFi.setAutoReconnect(false);
-      WiFi.disconnect(true, true);
-      wifiRecoveryStage = 2;
-      wifiRecoveryAt = now + WiFiCfg::RecoveryBackoffMs;
-      setStatus("WiFi recovery backoff before reconnect");
-    } else {
-      WiFi.mode(WIFI_STA);
-      WiFi.setAutoReconnect(true);
-      beginWiFiConnect();
-      wifiRecoveryPending = false;
-      wifiRecoveryStage = 0;
-      wifiAuthExpireStreak = 0;
-    }
+  if (startupWaitForWiFi && WiFi.status() == WL_CONNECTED) {
+    startupWaitForWiFi = false;
+    setStatus("WiFi connected");
+  }
+  if (configApEnabled && !apDisablePending && WiFi.status() == WL_CONNECTED) {
+    apDisablePending = true;
+    apDisableAt = now + WiFiCfg::ApAutoDisableDelayMs;
   }
   if (startupWaitForWiFi && WiFi.status() != WL_CONNECTED) {
     updateWiFiDiagnostics(now);

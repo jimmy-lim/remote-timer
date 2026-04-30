@@ -38,6 +38,12 @@ docker compose up -d --build
 
 - Keep device and server on the same network.
 - Data is saved and will remain after restart if your Docker volume is persistent.
+- Wi-Fi behavior (current firmware):
+  - Device starts STA mode and uses `WiFi.setAutoReconnect(true)`.
+  - Startup attempts one `WiFi.begin(...)`, then reconnects are handled by the Wi-Fi library.
+  - On startup, normal timer/button processing waits until Wi-Fi is connected, while config portal/network services keep running.
+  - Serial `Connecting WiFi...` shows masked password once per boot (only last 3 chars visible).
+  - Reconnect handling relies on library auto reconnect (no custom Wi-Fi event callback/recovery state machine).
 
 ## Simple Wiring Diagram
 
