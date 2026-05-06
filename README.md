@@ -69,4 +69,19 @@ Buzzer                       ESP32-C3
 - (negative) ---------------> GND
 ```
 
+### Alert LEDs (overdue indicators)
+
+```
+Timer alert LED               ESP32-C3
+---------------              ----------
+Alert 1 + (via resistor) ---> GPIO5
+Alert 2 + (via resistor) ---> GPIO6
+Alert 3 + (via resistor) ---> GPIO7
+Alert 4 + (via resistor) ---> GPIO9
+All LED - ------------------> GND
+```
+
+Each alert LED turns ON when its matching timer row is overdue in the UI (red row condition), and OFF otherwise.
+Note: GPIO9 is reserved for Alert 4 in current firmware (on-board right/BOOT button feature is disabled).
+
 Pin map above matches current firmware defaults in `remote-timer.ino`.

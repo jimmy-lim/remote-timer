@@ -171,6 +171,44 @@ function parseDurationToMs(value: unknown): number | null {
   return amount * multipliers[unit];
 }
 
+function buildDeviceStateText(store: Store, suffix: string): string {
+  const nowMs = Date.now();
+  const lines: string[] = [`now,${nowMs}`];
+
+  for (let button = 1; button <= 4; button++) {
+    const timerId = `${suffix}-${button}`;
+    const timestampMs = Number(store.timers[timerId] || 0);
+    const enrich = store.enrich[timerId];
+    const muted = enrich?.muted === true ? 1 : 0;
+    const alertAfterMs = parseDurationToMs(enrich?.alertAfter) ?? 0;
+    const alertIntervalMs = parseDurationToMs(enrich?.alertInterval) ?? 0;
+    lines.push(`${button},${timestampMs},${muted},${alertAfterMs},${alertIntervalMs}`);
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+function textResponse(content: string, init?: ResponseInit) {
+  return new Response(content, {
+    ...init,
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      ...(init?.headers || {})
+    }
+  });
+}
+
+function suffixFromTimerId(timerId: string): string | null {
+  const id = timerId.trim();
+  const dash = id.lastIndexOf("-");
+  if (dash <= 0 || dash >= id.length - 1) return null;
+  const suffix = id.slice(0, dash).trim();
+  const button = id.slice(dash + 1).trim();
+  if (!suffix || suffix.includes("/") || suffix.includes(" ")) return null;
+  if (!/^[1-4]$/.test(button)) return null;
+  return suffix;
+}
+
 Bun.serve({
   port: PORT,
   async fetch(request) {
@@ -184,8 +222,11 @@ Bun.serve({
       const store = await readStore();
       store.timers[timerId] = Date.now();
       await writeStore(store);
-
-      return new Response(null, { status: 204 });
+      const suffix = suffixFromTimerId(timerId);
+      if (!suffix) {
+        return new Response(null, { status: 204 });
+      }
+      return textResponse(buildDeviceStateText(store, suffix));
     }
 
     if (url.pathname === "/api/timer" && request.method === "DELETE") {
@@ -197,8 +238,11 @@ Bun.serve({
       const store = await readStore();
       delete store.timers[timerId];
       await writeStore(store);
-
-      return new Response(null, { status: 204 });
+      const suffix = suffixFromTimerId(timerId);
+      if (!suffix) {
+        return new Response(null, { status: 204 });
+      }
+      return textResponse(buildDeviceStateText(store, suffix));
     }
 
     if (url.pathname === "/api/timers" && request.method === "GET") {
@@ -287,22 +331,7 @@ Bun.serve({
       }
 
       const store = await readStore();
-      const nowMs = Date.now();
-      const lines: string[] = [`now,${nowMs}`];
-
-      for (let button = 1; button <= 4; button++) {
-        const timerId = `${suffix}-${button}`;
-        const timestampMs = Number(store.timers[timerId] || 0);
-        const enrich = store.enrich[timerId];
-        const muted = enrich?.muted === true ? 1 : 0;
-        const alertAfterMs = parseDurationToMs(enrich?.alertAfter) ?? 0;
-        const alertIntervalMs = parseDurationToMs(enrich?.alertInterval) ?? 0;
-        lines.push(`${button},${timestampMs},${muted},${alertAfterMs},${alertIntervalMs}`);
-      }
-
-      return new Response(`${lines.join("\n")}\n`, {
-        headers: { "content-type": "text/plain; charset=utf-8" }
-      });
+      return textResponse(buildDeviceStateText(store, suffix));
     }
 
     if (url.pathname === "/health") {

@@ -14,7 +14,6 @@
 constexpr uint8_t LED_PIN = 8;
 unsigned long lastLedToggle = 0;
 bool ledState = false;
-constexpr uint8_t RIGHT_BOARD_BUTTON_PIN = 9; // On-board right button (BOOT on most ESP32-C3 boards)
 
 // Buzzer output pin (adjust for your ESP32-C3 wiring).
 constexpr uint8_t BUZZER_PIN = 10;
@@ -24,13 +23,14 @@ constexpr uint16_t LONG_PRESS_TONES[4] = {784, 880, 988, 1047}; // So La Ti Do (
 // YK04 receiver outputs (adjust pins to match your board wiring).
 constexpr uint8_t BUTTON_PINS[4] = {0, 1, 3, 4};
 constexpr uint8_t BUTTON_COUNT = sizeof(BUTTON_PINS) / sizeof(BUTTON_PINS[0]);
+// Per-timer alert LED outputs (Timer 1..4).
+constexpr uint8_t ALERT_LED_PINS[BUTTON_COUNT] = {5, 6, 7, 9};
 namespace TimingCfg {
 constexpr unsigned long ToneMs = 90UL;
 constexpr unsigned long ToneGapMs = 70UL;
 constexpr unsigned long ButtonDebounceMs = 100UL;
 constexpr unsigned long ButtonLongPressMs = 3000UL;
 constexpr unsigned long ButtonPressCooldownMs = 1000UL;
-constexpr unsigned long DeviceStatePollMs = 60000UL;
 constexpr unsigned long AlertToneMs = 400UL;
 constexpr unsigned long AlertToneGapMs = 100UL;
 constexpr uint8_t AlertToneBeeps = 2;
@@ -38,8 +38,6 @@ constexpr unsigned long LoadedTimerToneStartDelayMs = 400UL;
 constexpr unsigned long LoadedTimerToneSpacingMs = 280UL;
 constexpr unsigned long LedToggleMs = 1000UL;
 constexpr unsigned long LoopDelayMs = 5UL;
-constexpr unsigned long BoardButtonDebounceMs = 40UL;
-constexpr unsigned long BoardButtonCooldownMs = 500UL;
 }
 
 namespace WiFiCfg {
@@ -134,15 +132,13 @@ bool configApEnabled = false;
 bool apDisablePending = false;
 unsigned long apDisableAt = 0;
 bool configPortalStarted = false;
-bool boardBtnStablePressed = false;
-bool boardBtnLastRawPressed = false;
-unsigned long boardBtnRawChangedAt = 0;
-unsigned long boardBtnCooldownUntil = 0;
 bool wifiPasswordShownAtBoot = false;
 bool startupWaitForWiFi = true;
 
 void startPortal();
 void ensureConfigServerStarted();
+void queueLoadedTimerTones();
+void applyTimerActionToAlertState(uint8_t buttonIndex, bool isDelete);
 
 const char* wifiStatusName(wl_status_t status) {
   switch (status) {
@@ -646,6 +642,142 @@ void updateConfigApAutoDisable(unsigned long now) {
   Serial.println("WIFI AP disabled after stable STA connection");
 }
 
+bool applyDeviceStateFromStream(WiFiClient* stream) {
+  if (stream == nullptr) {
+    return false;
+  }
+
+  const bool suppressInitialDueBeeps = !deviceStateLoaded;
+  uint64_t nowEpochMs = 0;
+  bool seenButton[BUTTON_COUNT] = {false, false, false, false};
+  bool parsedMutedByButton[BUTTON_COUNT] = {false, false, false, false};
+  uint64_t parsedTimestampMsByButton[BUTTON_COUNT] = {0, 0, 0, 0};
+  unsigned long parsedAlertAfterMsByButton[BUTTON_COUNT] = {0, 0, 0, 0};
+  unsigned long parsedAlertIntervalMsByButton[BUTTON_COUNT] = {0, 0, 0, 0};
+  bool sawDeviceStateLine = false;
+
+  char line[160];
+  while (stream->connected() || stream->available()) {
+    const size_t len = stream->readBytesUntil('\n', line, sizeof(line) - 1U);
+    if (len == 0) {
+      if (!stream->available()) {
+        break;
+      }
+      continue;
+    }
+
+    line[len] = '\0';
+    trimInPlace(line);
+    if (line[0] == '\0') {
+      continue;
+    }
+
+    char* c1 = strchr(line, ',');
+    if (c1 == nullptr || c1 == line) {
+      continue;
+    }
+    *c1 = '\0';
+
+    if (strcmp(line, "now") == 0) {
+      nowEpochMs = parseUint64(c1 + 1);
+      sawDeviceStateLine = true;
+      continue;
+    }
+
+    char* c2 = strchr(c1 + 1, ',');
+    char* c3 = c2 != nullptr ? strchr(c2 + 1, ',') : nullptr;
+    char* c4 = c3 != nullptr ? strchr(c3 + 1, ',') : nullptr;
+    if (c2 == nullptr || c3 == nullptr || c4 == nullptr) {
+      continue;
+    }
+
+    *c2 = '\0';
+    *c3 = '\0';
+    *c4 = '\0';
+
+    const long button = parseLong(line);
+    if (button < 1 || button > static_cast<long>(BUTTON_COUNT)) {
+      continue;
+    }
+
+    const uint8_t idx = static_cast<uint8_t>(button - 1);
+    const uint64_t timestampMs = parseUint64(c1 + 1);
+    const int mutedInt = static_cast<int>(parseLong(c2 + 1));
+    parsedMutedByButton[idx] = mutedInt != 0;
+    parsedTimestampMsByButton[idx] = timestampMs;
+    parsedAlertAfterMsByButton[idx] = clampToUlongMs(parseUint64(c3 + 1));
+    parsedAlertIntervalMsByButton[idx] = clampToUlongMs(parseUint64(c4 + 1));
+    seenButton[idx] = true;
+    sawDeviceStateLine = true;
+  }
+
+  if (!sawDeviceStateLine) {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
+    if (!seenButton[i]) {
+      alertMutedByButton[i] = false;
+      alertAfterMsByButton[i] = 0;
+      alertIntervalMsByButton[i] = 0;
+      timerActiveByButton[i] = false;
+      timerElapsedBaseMsByButton[i] = 0;
+      timerElapsedBaseAtMsByButton[i] = 0;
+      timerEpochMsByButton[i] = 0;
+      lastAlertIndex[i] = -1;
+      continue;
+    }
+
+    alertMutedByButton[i] = parsedMutedByButton[i];
+    alertAfterMsByButton[i] = parsedAlertAfterMsByButton[i];
+    alertIntervalMsByButton[i] = parsedAlertIntervalMsByButton[i];
+
+    if (alertMutedByButton[i]) {
+      timerActiveByButton[i] = false;
+      timerElapsedBaseMsByButton[i] = 0;
+      timerElapsedBaseAtMsByButton[i] = 0;
+      timerEpochMsByButton[i] = 0;
+      lastAlertIndex[i] = -1;
+      continue;
+    }
+
+    const uint64_t timestampMs = parsedTimestampMsByButton[i];
+    if (timestampMs > 0 && nowEpochMs > 0 && nowEpochMs >= timestampMs) {
+      const bool timerChanged = timerEpochMsByButton[i] != timestampMs;
+      timerEpochMsByButton[i] = timestampMs;
+      const uint64_t elapsedMs64 = nowEpochMs - timestampMs;
+      const unsigned long nowMs = millis();
+      timerActiveByButton[i] = true;
+      timerElapsedBaseMsByButton[i] = elapsedMs64;
+      timerElapsedBaseAtMsByButton[i] = nowMs;
+
+      if (suppressInitialDueBeeps) {
+        const unsigned long elapsedMs = clampToUlongMs(elapsedMs64);
+        lastAlertIndex[i] = alertIndexForElapsed(elapsedMs, alertAfterMsByButton[i], alertIntervalMsByButton[i]);
+      } else if (timerChanged) {
+        lastAlertIndex[i] = -1;
+      }
+    } else {
+      timerActiveByButton[i] = false;
+      timerElapsedBaseMsByButton[i] = 0;
+      timerElapsedBaseAtMsByButton[i] = 0;
+      timerEpochMsByButton[i] = 0;
+      lastAlertIndex[i] = -1;
+    }
+  }
+
+  if (!deviceStateLoaded) {
+    deviceStateLoaded = true;
+    if (!loadedTimerTonesPlayedThisBoot) {
+      loadedTimerTonesPlayedThisBoot = true;
+      queueLoadedTimerTones();
+    }
+    setStatus("Loaded device alert state");
+  }
+
+  return true;
+}
+
 bool performTimerAction(uint8_t buttonIndex, const char* action) {
   if (WiFi.status() != WL_CONNECTED) {
     setStatus("API skipped: no WiFi");
@@ -681,19 +813,32 @@ bool performTimerAction(uint8_t buttonIndex, const char* action) {
   }
 
   int code = 0;
-  if (strcmp(action, "delete") == 0) {
+  const bool isDelete = strcmp(action, "delete") == 0;
+  if (isDelete) {
     code = http.sendRequest("DELETE");
   } else {
     code = http.sendRequest("POST");
   }
 
   if (code >= 200 && code < 300) {
+    const bool synced = applyDeviceStateFromStream(http.getStreamPtr());
+    if (!synced) {
+      applyTimerActionToAlertState(buttonIndex, isDelete);
+    }
     http.end();
     if (networkMutex != nullptr) {
       xSemaphoreGive(networkMutex);
     }
-    char msg[64];
-    snprintf(msg, sizeof(msg), "%s btn %u OK (%d)", action, static_cast<unsigned>(buttonIndex + 1), code);
+    char msg[84];
+    snprintf(
+      msg,
+      sizeof(msg),
+      "%s btn %u OK (%d)%s",
+      action,
+      static_cast<unsigned>(buttonIndex + 1),
+      code,
+      synced ? " sync" : " fallback"
+    );
     setStatus(msg);
     return true;
   }
@@ -848,11 +993,6 @@ void enqueueStartupToneSeriesReversed() {
   }
 }
 
-void runSelfTestMelody() {
-  Serial.println("Self-test: reversed startup tones");
-  enqueueStartupToneSeriesReversed();
-}
-
 void queueLoadedTimerTones() {
   uint8_t pendingMask = 0;
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
@@ -932,7 +1072,6 @@ void processTimerActions() {
   uint8_t processed = 0;
   while (processed < LimitsCfg::ActionQueueLen && xQueueReceive(actionQueue, &action, 0) == pdTRUE) {
     if (performTimerAction(action.buttonIndex, action.isDelete ? "delete" : "set")) {
-      applyTimerActionToAlertState(action.buttonIndex, action.isDelete);
       enqueueTonePattern(action.buttonIndex, action.isDelete, 1);
     }
     processed++;
@@ -997,34 +1136,6 @@ void handleButtonAction(uint8_t i, bool isLongPress) {
   }
 }
 
-void updateBoardButton(unsigned long now) {
-  // On-board button is active LOW with pull-up.
-  const bool rawPressed = digitalRead(RIGHT_BOARD_BUTTON_PIN) == LOW;
-
-  if (rawPressed != boardBtnLastRawPressed) {
-    boardBtnLastRawPressed = rawPressed;
-    boardBtnRawChangedAt = now;
-  }
-
-  if ((now - boardBtnRawChangedAt) < TimingCfg::BoardButtonDebounceMs) {
-    return;
-  }
-
-  if ((long)(now - boardBtnCooldownUntil) < 0) {
-    boardBtnStablePressed = rawPressed;
-    return;
-  }
-
-  if (rawPressed != boardBtnStablePressed) {
-    boardBtnStablePressed = rawPressed;
-    // Trigger on release after a valid press.
-    if (!boardBtnStablePressed) {
-      runSelfTestMelody();
-      boardBtnCooldownUntil = now + TimingCfg::BoardButtonCooldownMs;
-    }
-  }
-}
-
 void updateButtons() {
   unsigned long now = millis();
 
@@ -1076,7 +1187,8 @@ void pollDeviceState(unsigned long now) {
   if (WiFi.status() != WL_CONNECTED || !deviceStateUrl.length()) {
     return;
   }
-  if (lastDeviceStateFetchAttempt != 0 && (now - lastDeviceStateFetchAttempt < TimingCfg::DeviceStatePollMs)) {
+  // One-time fetch at boot (or first connectivity), no periodic polling.
+  if (lastDeviceStateFetchAttempt != 0) {
     return;
   }
   lastDeviceStateFetchAttempt = now;
@@ -1096,141 +1208,12 @@ void pollDeviceState(unsigned long now) {
   }
 
   const int code = http.GET();
-  if (code != 200) {
-    http.end();
-    if (networkMutex != nullptr) {
-      xSemaphoreGive(networkMutex);
-    }
-    return;
-  }
-
-  const bool suppressInitialDueBeeps = !deviceStateLoaded;
-  uint64_t nowEpochMs = 0;
-  bool seenButton[BUTTON_COUNT] = {false, false, false, false};
-  bool parsedMutedByButton[BUTTON_COUNT] = {false, false, false, false};
-  uint64_t parsedTimestampMsByButton[BUTTON_COUNT] = {0, 0, 0, 0};
-  unsigned long parsedAlertAfterMsByButton[BUTTON_COUNT] = {0, 0, 0, 0};
-  unsigned long parsedAlertIntervalMsByButton[BUTTON_COUNT] = {0, 0, 0, 0};
-  WiFiClient* stream = http.getStreamPtr();
-  char line[160];
-  while (stream != nullptr && (stream->connected() || stream->available())) {
-    const size_t len = stream->readBytesUntil('\n', line, sizeof(line) - 1U);
-    if (len == 0) {
-      if (!stream->available()) {
-        break;
-      }
-      continue;
-    }
-
-    line[len] = '\0';
-    trimInPlace(line);
-    if (line[0] == '\0') {
-      continue;
-    }
-
-    char* c1 = strchr(line, ',');
-    if (c1 == nullptr || c1 == line) {
-      continue;
-    }
-    *c1 = '\0';
-
-    if (strcmp(line, "now") == 0) {
-      nowEpochMs = parseUint64(c1 + 1);
-      continue;
-    }
-
-    char* c2 = strchr(c1 + 1, ',');
-    char* c3 = c2 != nullptr ? strchr(c2 + 1, ',') : nullptr;
-    char* c4 = c3 != nullptr ? strchr(c3 + 1, ',') : nullptr;
-    if (c2 == nullptr || c3 == nullptr || c4 == nullptr) {
-      continue;
-    }
-
-    *c2 = '\0';
-    *c3 = '\0';
-    *c4 = '\0';
-
-    const long button = parseLong(line);
-    if (button < 1 || button > static_cast<long>(BUTTON_COUNT)) {
-      continue;
-    }
-
-    const uint8_t idx = static_cast<uint8_t>(button - 1);
-    const uint64_t timestampMs = parseUint64(c1 + 1);
-    const int mutedInt = static_cast<int>(parseLong(c2 + 1));
-    parsedMutedByButton[idx] = mutedInt != 0;
-    parsedTimestampMsByButton[idx] = timestampMs;
-    parsedAlertAfterMsByButton[idx] = clampToUlongMs(parseUint64(c3 + 1));
-    parsedAlertIntervalMsByButton[idx] = clampToUlongMs(parseUint64(c4 + 1));
-    seenButton[idx] = true;
+  if (code == 200) {
+    applyDeviceStateFromStream(http.getStreamPtr());
   }
   http.end();
   if (networkMutex != nullptr) {
     xSemaphoreGive(networkMutex);
-  }
-
-  for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
-    if (!seenButton[i]) {
-      alertMutedByButton[i] = false;
-      alertAfterMsByButton[i] = 0;
-      alertIntervalMsByButton[i] = 0;
-      timerActiveByButton[i] = false;
-      timerElapsedBaseMsByButton[i] = 0;
-      timerElapsedBaseAtMsByButton[i] = 0;
-      timerEpochMsByButton[i] = 0;
-      lastAlertIndex[i] = -1;
-      continue;
-    }
-
-    alertMutedByButton[i] = parsedMutedByButton[i];
-    alertAfterMsByButton[i] = parsedAlertAfterMsByButton[i];
-    alertIntervalMsByButton[i] = parsedAlertIntervalMsByButton[i];
-
-    if (alertMutedByButton[i]) {
-      // Fully drop muted timers from local processing.
-      timerActiveByButton[i] = false;
-      timerElapsedBaseMsByButton[i] = 0;
-      timerElapsedBaseAtMsByButton[i] = 0;
-      timerEpochMsByButton[i] = 0;
-      lastAlertIndex[i] = -1;
-      continue;
-    }
-
-    const uint64_t timestampMs = parsedTimestampMsByButton[i];
-    if (timestampMs > 0 && nowEpochMs > 0 && nowEpochMs >= timestampMs) {
-      const bool timerChanged = timerEpochMsByButton[i] != timestampMs;
-      timerEpochMsByButton[i] = timestampMs;
-      const uint64_t elapsedMs64 = nowEpochMs - timestampMs;
-      const unsigned long nowMs = millis();
-      timerActiveByButton[i] = true;
-      timerElapsedBaseMsByButton[i] = elapsedMs64;
-      timerElapsedBaseAtMsByButton[i] = nowMs;
-
-      if (suppressInitialDueBeeps) {
-        const unsigned long elapsedMs = clampToUlongMs(elapsedMs64);
-        // On first load, seed alert index from current elapsed to avoid immediate overdue beeps.
-        lastAlertIndex[i] = alertIndexForElapsed(elapsedMs, alertAfterMsByButton[i], alertIntervalMsByButton[i]);
-      } else if (timerChanged) {
-        // On a newly observed timer timestamp, reset alert index so the next
-        // local tick can trigger the first due alert beep at/after alertAfter.
-        lastAlertIndex[i] = -1;
-      }
-    } else {
-      timerActiveByButton[i] = false;
-      timerElapsedBaseMsByButton[i] = 0;
-      timerElapsedBaseAtMsByButton[i] = 0;
-      timerEpochMsByButton[i] = 0;
-      lastAlertIndex[i] = -1;
-    }
-  }
-
-  if (!deviceStateLoaded) {
-    deviceStateLoaded = true;
-    if (!loadedTimerTonesPlayedThisBoot) {
-      loadedTimerTonesPlayedThisBoot = true;
-      queueLoadedTimerTones();
-    }
-    setStatus("Loaded device alert state");
   }
 }
 
@@ -1259,8 +1242,31 @@ void updateLocalAlerts(unsigned long now) {
   }
 }
 
+bool isButtonOverdueForUiRow(uint8_t buttonIndex, unsigned long now) {
+  if (buttonIndex >= BUTTON_COUNT || !timerActiveByButton[buttonIndex] || alertMutedByButton[buttonIndex]) {
+    return false;
+  }
+  const unsigned long alertAfterMs = alertAfterMsByButton[buttonIndex];
+  if (alertAfterMs == 0) {
+    return false;
+  }
+  const unsigned long elapsedMs = effectiveElapsedMs(buttonIndex, now);
+  return elapsedMs > alertAfterMs;
+}
+
+void updateAlertLeds(unsigned long now) {
+  for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
+    const bool isOverdue = isButtonOverdueForUiRow(i, now);
+    digitalWrite(ALERT_LED_PINS[i], isOverdue ? HIGH : LOW);
+  }
+}
+
 void setup() {
   pinMode(LED_PIN, OUTPUT);
+  for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
+    pinMode(ALERT_LED_PINS[i], OUTPUT);
+    digitalWrite(ALERT_LED_PINS[i], LOW);
+  }
 
   Serial.begin(115200);
   Serial.println("=== ESP32-C3 Remote Timer Boot ===");
@@ -1275,7 +1281,6 @@ void setup() {
 
   ledcAttach(BUZZER_PIN, 2000, 8);
   ledcWriteTone(BUZZER_PIN, 0);
-  pinMode(RIGHT_BOARD_BUTTON_PIN, INPUT_PULLUP);
 
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
     pinMode(BUTTON_PINS[i], INPUT);
@@ -1311,17 +1316,20 @@ void loop() {
     apDisableAt = now + WiFiCfg::ApAutoDisableDelayMs;
   }
   if (startupWaitForWiFi && WiFi.status() != WL_CONNECTED) {
+    updateAlertLeds(now);
     updateWiFiDiagnostics(now);
     updateConfigApAutoDisable(now);
     delay(TimingCfg::LoopDelayMs);
     return;
   }
   updateButtons();
-  updateBoardButton(now);
   processTimerActions();
-  pollDeviceState(now);
+  if (!deviceStateLoaded && lastDeviceStateFetchAttempt == 0) {
+    pollDeviceState(now);
+  }
   now = millis();
   updateLocalAlerts(now);
+  updateAlertLeds(now);
   flushLoadedTimerToneQueue(now);
   updateTone(now);
   updateWiFiDiagnostics(now);
